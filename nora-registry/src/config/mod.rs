@@ -1,0 +1,6113 @@
+// Copyright (c) 2026 The NORA Authors
+// SPDX-License-Identifier: MIT
+
+//! NORA registry configuration module.
+//!
+//! Configuration is loaded with three-tier priority: ENV > config file > defaults.
+//! Each subsystem (server, storage, auth, registries, etc.) is defined in its own
+//! submodule for maintainability.
+
+mod audit_cfg;
+mod auth;
+mod circuit_breaker;
+mod curation;
+mod gc;
+mod rate_limit;
+mod registries;
+pub mod registry;
+mod retention;
+mod server;
+mod signing_cfg;
+mod storage;
+mod watch;
+
+// Infrastructure configs
+pub use self::audit_cfg::AuditConfig;
+pub use self::signing_cfg::SigningConfig;
+// Re-exports maintain API surface: `crate::config::OidcRoleRule` etc. used by test code in auth/, circuit_breaker/
+#[allow(unused_imports)]
+pub use self::auth::{
+    AuthConfig, OidcConfig, OidcProvider, OidcRoleRule, ScopeEnforcement, TrustedProxies,
+};
+#[allow(unused_imports)]
+pub use self::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerOverride};
+pub use self::curation::{CurationConfig, CurationMode, CurationOnFailure};
+pub use self::gc::GcConfig;
+pub use self::rate_limit::RateLimitConfig;
+pub use self::registries::{EnableSpec, RegistriesSection};
+pub use self::retention::{RetentionConfig, RetentionRule};
+pub use self::server::{ServerConfig, TlsConfig};
+pub use self::storage::{StorageConfig, StorageMode};
+pub use self::watch::WatchConfig;
+
+// Registry configs (re-exported from registry/ submodule tree)
+pub use self::registry::*;
+
+// Secrets config lives in crate::secrets — just re-export
+pub use crate::secrets::SecretsConfig;
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::env;
+use std::fs;
+
+use crate::registry_type::RegistryType;
+
+/// Exit status for a configuration NORA cannot start with: EX_CONFIG from sysexits.h.
+/// The unit files name it in `RestartPreventExitStatus=`, so systemd stops the service
+/// on it instead of restarting into the same error every few seconds (#1025).
+pub const EXIT_CONFIG: i32 = 78;
+
+/// Why [`Config::load`] could not produce a configuration to start with.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigLoadError {
+    /// `NORA_CONFIG_PATH` names a file that cannot be read.
+    #[error("NORA_CONFIG_PATH={path} but file cannot be read: {source}")]
+    Unreadable {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// `NORA_CONFIG_PATH` names a file that is not valid TOML.
+    #[error("NORA_CONFIG_PATH={path} contains invalid TOML: {source}")]
+    InvalidToml {
+        path: String,
+        #[source]
+        source: toml::de::Error,
+    },
+    /// An environment override has a value that cannot be applied.
+    #[error("fatal env override error: {0}")]
+    EnvOverride(String),
+    /// Validation found errors that make the configuration unusable.
+    #[error("fatal configuration errors: {}", .0.join("; "))]
+    Invalid(Vec<String>),
+    /// The config file has keys no setting reads, and `NORA_CONFIG_STRICT` refuses them.
+    #[error(
+        "{path} has unknown keys: {} (NORA_CONFIG_STRICT is on)",
+        .keys.join(", ")
+    )]
+    UnknownKeys { path: String, keys: Vec<String> },
+}
+
+/// The config file read from the working directory when `NORA_CONFIG_PATH` is unset.
+const DEFAULT_CONFIG_FILE: &str = "config.toml";
+
+/// Whether `NORA_CONFIG_STRICT` asks to refuse a config file with unknown keys.
+fn config_strict_from_env() -> bool {
+    env::var("NORA_CONFIG_STRICT").is_ok_and(|val| val.to_lowercase() == "true" || val == "1")
+}
+
+/// Parses a config file into a [`Config`] and the paths of the keys no setting reads,
+/// such as `curation.mdoe` for a typo of `mode`.
+fn parse_config(content: &str) -> Result<(Config, Vec<String>), toml::de::Error> {
+    let mut unknown = Vec::new();
+    let mut config: Config =
+        serde_ignored::deserialize(toml::Deserializer::parse(content)?, |path| {
+            unknown.push(key_path(&path))
+        })?;
+    // serde fills a missing `mode` with its default; whether it was written down is read from
+    // the file itself (#1135).
+    config.curation.mode_explicit = content
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|table| table.get("curation")?.get("mode").cloned())
+        .is_some();
+    Ok((config, unknown))
+}
+
+/// What startup says about `curation.mode` while proxy registries are enabled (#1135).
+#[derive(Debug, PartialEq, Eq)]
+pub enum CurationModeNotice {
+    /// `mode` is off only by default: from 1.5.0 such a configuration stops at startup.
+    Implicit(Vec<RegistryType>),
+    /// `mode = "off"` is written down: the operator accepts serving upstream packages unchecked.
+    ExplicitOff(Vec<RegistryType>),
+}
+
+/// `curation.mdoe`, `docker.upstreams.0.auht`: map keys and sequence indices joined by
+/// dots. `serde_ignored` prints `Option` layers as `?`; they are not part of the file.
+fn key_path(path: &serde_ignored::Path<'_>) -> String {
+    use serde_ignored::Path;
+    let mut segments = Vec::new();
+    let mut at = path;
+    loop {
+        at = match at {
+            Path::Root => break,
+            Path::Seq { parent, index } => {
+                segments.push(index.to_string());
+                parent
+            }
+            Path::Map { parent, key } => {
+                segments.push(key.clone());
+                parent
+            }
+            Path::Some { parent }
+            | Path::NewtypeStruct { parent }
+            | Path::NewtypeVariant { parent } => parent,
+        };
+    }
+    segments.reverse();
+    segments.join(".")
+}
+
+/// The per-registry curation variables a Hugging Face section would read if there were one.
+fn hf_curation_env_vars() -> [&'static str; 3] {
+    [
+        "NORA_CURATION_HF_MIN_RELEASE_AGE",
+        "NORA_CURATION_HF_QUARANTINE",
+        "NORA_CURATION_HF_QUARANTINE_TTL",
+    ]
+}
+
+/// Why a Hugging Face curation setting is refused: it would hold nothing.
+fn hf_curation_refusal(setting: &str) -> String {
+    format!(
+        "{setting} cannot apply: Hugging Face has no curation section of its own (a Hub commit has no publish date NORA reads, and hf has no quarantine path), so it would hold nothing. Remove it; the allowlist and blocklist hold Hugging Face models by repository id and commit. (#579)"
+    )
+}
+
+/// `[curation.hf]` in a config file: refused, not reported as an unknown key and ignored.
+fn refuse_hf_curation_keys(path: &str, unknown: &[String]) -> Result<(), ConfigLoadError> {
+    let refused: Vec<String> = unknown
+        .iter()
+        .filter(|k| *k == "curation.hf" || k.starts_with("curation.hf."))
+        .map(|k| format!("{path}: {}", hf_curation_refusal(k)))
+        .collect();
+    if refused.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigLoadError::Invalid(refused))
+    }
+}
+
+/// Reports the unknown keys of the config file at `path`: one warning listing them all,
+/// or, when `strict`, an error. Returns them for the caller.
+fn surface_unknown_keys(
+    path: &str,
+    keys: Vec<String>,
+    strict: bool,
+) -> Result<Vec<String>, ConfigLoadError> {
+    if keys.is_empty() {
+        return Ok(keys);
+    }
+    if strict {
+        return Err(ConfigLoadError::UnknownKeys {
+            path: path.to_string(),
+            keys,
+        });
+    }
+    tracing::warn!(
+        path = %path,
+        keys = %keys.join(", "),
+        "Config has unknown keys, ignored; NORA_CONFIG_STRICT=true refuses them"
+    );
+    Ok(keys)
+}
+
+// --- Shared defaults (used by submodules via `super::default_*`) ---
+
+/// Returns `true` — used as serde default for boolean fields that should default to enabled.
+/// An upstream setting as written: empty (or only whitespace) switches the upstream off. One rule
+/// for the environment variable and the config file, so `NORA_<FMT>_PROXY=""` and `proxy = ""`
+/// mean the same.
+pub(crate) fn upstream_setting(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+/// The upstream a handler may ask: None when the setting is absent or blank, whatever wrote it
+/// (environment, config file, or code). Every handler reads its upstream through this, so a blank
+/// value can never reach a request.
+pub(crate) fn configured_upstream(setting: &Option<String>) -> Option<&str> {
+    setting.as_deref().filter(|value| !value.trim().is_empty())
+}
+
+/// `proxy = ""` in the config file reads as no upstream, like the empty environment variable.
+pub(crate) fn deserialize_upstream<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(value.and_then(upstream_setting))
+}
+
+pub(crate) fn default_true() -> bool {
+    true
+}
+
+/// Default proxy timeout in seconds (30s).
+pub(crate) fn default_timeout() -> u64 {
+    30
+}
+
+/// Default metadata TTL in seconds (300s = 5 minutes).
+pub(crate) fn default_metadata_ttl() -> i64 {
+    300
+}
+
+/// Encode "user:pass" into a Basic Auth header value, e.g. "Basic dXNlcjpwYXNz".
+pub fn basic_auth_header(credentials: &str) -> String {
+    format!("Basic {}", STANDARD.encode(credentials))
+}
+
+/// The credential NORA presents to an upstream it proxies, with its scheme (#1055).
+///
+/// Borrowed from the config's protected secret for the length of one request. There is
+/// deliberately no `Debug` impl (guarded below at compile time): a `{:?}` on a request
+/// context must not be able to print a token.
+#[derive(Clone, Copy)]
+pub enum UpstreamAuth<'a> {
+    /// `user:pass`, sent as `Authorization: Basic base64(user:pass)`.
+    Basic(&'a str),
+    /// An opaque token (npm `_authToken`), sent as `Authorization: Bearer <token>`.
+    Bearer(&'a str),
+}
+
+impl UpstreamAuth<'_> {
+    /// The `Authorization` header value, marked sensitive so `HeaderValue`'s `Debug`
+    /// prints `Sensitive` instead of the credential.
+    ///
+    /// Fails only for a Bearer token with bytes a header cannot carry (a newline left by
+    /// a secret file, say); Basic is base64 and always valid.
+    pub fn header_value(
+        self,
+    ) -> Result<reqwest::header::HeaderValue, reqwest::header::InvalidHeaderValue> {
+        let raw = match self {
+            UpstreamAuth::Basic(credentials) => basic_auth_header(credentials),
+            UpstreamAuth::Bearer(token) => format!("Bearer {token}"),
+        };
+        let mut value = reqwest::header::HeaderValue::from_str(&raw)?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+}
+
+// Compile-time guard: `UpstreamAuth` must not implement `Debug`. If it did, both impls
+// below would apply and the type of `_` could not be inferred — a build error, not a
+// review comment.
+const _: fn() = || {
+    trait AmbiguousIfDebug<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfDebug<()> for T {}
+    impl<T: ?Sized + std::fmt::Debug> AmbiguousIfDebug<u8> for T {}
+    let _ = <UpstreamAuth<'static> as AmbiguousIfDebug<_>>::some_item;
+};
+
+/// Path component of a URL (`https://host/prefix/` → `/prefix/`), or `""` when
+/// there is no path. The scheme is optional — a bare path is returned unchanged.
+/// Does not trim a trailing slash (callers that want it trimmed do so). Single
+/// source of truth for "drop scheme + authority, keep path"; used by
+/// [`ServerConfig::base_path`](server::ServerConfig::base_path) and the ansible
+/// metadata rewriter so the two cannot drift.
+pub(crate) fn url_path_component(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    after_scheme.find('/').map_or("", |i| &after_scheme[i..])
+}
+
+/// Parse an env var value into `target`, warning on failure (#537).
+///
+/// If `val` parses successfully, `*target` is updated. If parsing fails,
+/// a `warn!` is emitted with the variable name and invalid value, and
+/// `*target` is left unchanged (keeps the TOML/default value).
+pub(crate) fn parse_env_warn<T: std::str::FromStr + std::fmt::Display>(
+    name: &str,
+    val: &str,
+    target: &mut T,
+) {
+    match val.parse::<T>() {
+        Ok(parsed) => {
+            *target = parsed;
+        }
+        Err(_) => {
+            tracing::warn!(
+                var = name,
+                value = val,
+                "env override ignored: failed to parse value"
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub maven: MavenConfig,
+    #[serde(default)]
+    pub npm: NpmConfig,
+    #[serde(default)]
+    pub pypi: PypiConfig,
+    #[serde(default)]
+    pub docker: DockerConfig,
+    #[serde(default)]
+    pub go: GoConfig,
+    #[serde(default)]
+    pub cargo: CargoConfig,
+    #[serde(default)]
+    pub raw: RawConfig,
+    #[serde(default)]
+    pub gems: GemsConfig,
+    #[serde(default)]
+    pub terraform: TerraformConfig,
+    #[serde(default)]
+    pub ansible: AnsibleConfig,
+    #[serde(default)]
+    pub nuget: NugetConfig,
+    #[serde(default)]
+    pub pub_dart: PubDartConfig,
+    #[serde(default)]
+    pub conan: ConanConfig,
+    #[serde(default)]
+    pub rpm: RpmConfig,
+    #[serde(default)]
+    pub deb: DebConfig,
+    #[serde(default)]
+    pub cpan: CpanConfig,
+    #[serde(default)]
+    pub hf: HfConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+    #[serde(default)]
+    pub gc: GcConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
+    #[serde(default)]
+    pub curation: CurationConfig,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+    #[serde(default)]
+    pub tls: TlsConfig,
+    #[serde(default)]
+    pub audit: AuditConfig,
+    #[serde(default)]
+    pub signing: SigningConfig,
+    /// Out-of-band storage change watch (deb/rpm/raw file drops, rebuilds
+    /// `Packages`/`repodata`, drives real-time UI refresh). See
+    /// [`WatchConfig`].
+    #[serde(default)]
+    pub watch: WatchConfig,
+    /// Declarative registry selection: `[registries] enable = ["docker", "npm"]`
+    #[serde(default)]
+    pub registries: Option<RegistriesSection>,
+}
+
+/// Whether a registry's downloads are checked against a release date at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseDateCheck {
+    /// Checked by name and release date.
+    Dated,
+    /// Not checked by name or release date: only the digest quarantine holds them (rpm, deb).
+    NoNameOrDate,
+    /// Checked by name, but no release date reaches the check (cpan, hf).
+    NoDate,
+}
+
+/// The environment variable of `rt`'s own `enabled` flag.
+pub(crate) fn legacy_enable_var(rt: RegistryType) -> &'static str {
+    match rt {
+        RegistryType::Docker => "NORA_DOCKER_ENABLED",
+        RegistryType::Maven => "NORA_MAVEN_ENABLED",
+        RegistryType::Npm => "NORA_NPM_ENABLED",
+        RegistryType::Cargo => "NORA_CARGO_ENABLED",
+        RegistryType::PyPI => "NORA_PYPI_ENABLED",
+        RegistryType::Go => "NORA_GO_ENABLED",
+        RegistryType::Raw => "NORA_RAW_ENABLED",
+        RegistryType::Gems => "NORA_GEMS_ENABLED",
+        RegistryType::Terraform => "NORA_TF_ENABLED",
+        RegistryType::Ansible => "NORA_ANSIBLE_ENABLED",
+        RegistryType::Nuget => "NORA_NUGET_ENABLED",
+        RegistryType::PubDart => "NORA_PUB_ENABLED",
+        RegistryType::Conan => "NORA_CONAN_ENABLED",
+        RegistryType::Rpm => "NORA_RPM_ENABLED",
+        RegistryType::Deb => "NORA_DEB_ENABLED",
+        RegistryType::Cpan => "NORA_CPAN_ENABLED",
+        RegistryType::HuggingFace => "NORA_HF_ENABLED",
+    }
+}
+
+/// The release-date check of `rt`'s downloads, as each handler calls curation.
+pub(crate) fn release_date_check(rt: RegistryType) -> ReleaseDateCheck {
+    match rt {
+        RegistryType::Rpm | RegistryType::Deb => ReleaseDateCheck::NoNameOrDate,
+        // registry/cpan.rs passes no publish date; a Hub commit has none NORA reads.
+        RegistryType::Cpan | RegistryType::HuggingFace => ReleaseDateCheck::NoDate,
+        RegistryType::Docker
+        | RegistryType::Maven
+        | RegistryType::Npm
+        | RegistryType::Cargo
+        | RegistryType::PyPI
+        | RegistryType::Go
+        | RegistryType::Raw
+        | RegistryType::Gems
+        | RegistryType::Terraform
+        | RegistryType::Ansible
+        | RegistryType::Nuget
+        | RegistryType::PubDart
+        | RegistryType::Conan => ReleaseDateCheck::Dated,
+    }
+}
+
+/// What startup knows about one registry for its own `[curation.<registry>]
+/// min_release_age`, as plain facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RegistryMinAgeFacts {
+    /// The registry's own `min_release_age` is set.
+    pub value_set: bool,
+    /// Whether its downloads are checked against a release date.
+    pub dated: ReleaseDateCheck,
+    /// The registry is enabled.
+    pub enabled: bool,
+    /// The registry is an enabled proxy: it has an upstream.
+    pub proxy: bool,
+    /// The registry's effective quarantine — its own or the global one — is on.
+    pub quarantined: bool,
+}
+
+/// What startup does with a registry's own `min_release_age`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistryMinAgeVerdict {
+    /// No value set.
+    NotSet,
+    /// Applied to the registry's downloads: an active control.
+    Applies,
+    /// The registry is disabled: the value holds nothing (a warning, not a control).
+    Unused,
+    /// The value can never apply to these downloads (an error).
+    CannotApply,
+    /// An enabled proxy without a quarantine of its own (an error, #741): what the
+    /// filter cannot date, nothing would hold.
+    NeedsQuarantine,
+}
+
+/// The verdict on a registry's own `min_release_age`, from its facts alone (#1098).
+pub(crate) fn registry_min_age_verdict(facts: RegistryMinAgeFacts) -> RegistryMinAgeVerdict {
+    if !facts.value_set {
+        RegistryMinAgeVerdict::NotSet
+    } else if facts.dated != ReleaseDateCheck::Dated {
+        RegistryMinAgeVerdict::CannotApply
+    } else if !facts.enabled {
+        RegistryMinAgeVerdict::Unused
+    } else if facts.proxy && !facts.quarantined {
+        RegistryMinAgeVerdict::NeedsQuarantine
+    } else {
+        RegistryMinAgeVerdict::Applies
+    }
+}
+
+impl Config {
+    /// Returns the set of enabled registry types.
+    ///
+    /// Resolution priority (three tiers):
+    /// 1. `NORA_REGISTRIES_ENABLE` env var (highest)
+    /// 2. `[registries].enable` from TOML config
+    /// 3. Legacy per-registry `enabled` flags (backward compatible)
+    pub fn enabled_registries(&self) -> HashSet<RegistryType> {
+        self.resolve_enabled_registries(env::var("NORA_REGISTRIES_ENABLE").ok(), true)
+    }
+
+    /// [`Self::enabled_registries`] without logging: `load` resolves it before validation,
+    /// and `main` logs the selection once at start.
+    fn enabled_registries_quiet(&self) -> HashSet<RegistryType> {
+        self.resolve_enabled_registries(env::var("NORA_REGISTRIES_ENABLE").ok(), false)
+    }
+
+    /// The enable-set from `NORA_REGISTRIES_ENABLE` (`env_spec`), else `[registries].enable`,
+    /// else the per-registry flags; the selection and a fallback are logged when `log`.
+    fn resolve_enabled_registries(
+        &self,
+        env_spec: Option<String>,
+        log: bool,
+    ) -> HashSet<RegistryType> {
+        // Tier 1: NORA_REGISTRIES_ENABLE env var
+        if let Some(val) = env_spec {
+            if !val.is_empty() {
+                let spec = EnableSpec::from_env_str(&val);
+                match spec.resolve() {
+                    Ok(set) => {
+                        if log {
+                            Self::warn_legacy_env_vars_if_present();
+                            tracing::info!(
+                                registries = ?set.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                                "Registry selection from NORA_REGISTRIES_ENABLE"
+                            );
+                        }
+                        return set;
+                    }
+                    Err(e) => {
+                        if log {
+                            tracing::error!(
+                                "NORA_REGISTRIES_ENABLE is invalid: {} — falling back",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Tier 2: [registries].enable from TOML
+        if let Some(ref section) = self.registries {
+            if let Some(ref spec) = section.enable {
+                match spec.resolve() {
+                    Ok(set) => {
+                        if log {
+                            Self::warn_legacy_env_vars_if_present();
+                            tracing::info!(
+                                registries = ?set.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                                "Registry selection from [registries].enable"
+                            );
+                        }
+                        return set;
+                    }
+                    Err(e) => {
+                        if log {
+                            tracing::error!(
+                                "[registries].enable is invalid: {} — falling back to legacy",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Tier 3: legacy per-registry enabled flags
+        self.enabled_registries_legacy()
+    }
+
+    /// Materialize the resolved enable-set into the per-registry `enabled` flags.
+    ///
+    /// Route mounting is driven by [`Self::enabled_registries`], but the hosted
+    /// handlers (rpm/deb/raw) additionally re-check `config.<reg>.enabled`. When
+    /// the enable-set is resolved from `NORA_REGISTRIES_ENABLE` or
+    /// `[registries].enable`, those per-registry flags stay at their struct
+    /// defaults, so a mounted rpm/deb route still 404s on every request. Writing
+    /// the resolved set back keeps the two in sync. Call once at startup, right
+    /// after [`Self::enabled_registries`]. The `match` is exhaustive over
+    /// [`RegistryType`], so a new variant is a compile error until its flag is
+    /// wired here. (#856)
+    pub fn apply_enabled_registries(&mut self, set: &HashSet<RegistryType>) {
+        for rt in RegistryType::all() {
+            let on = set.contains(rt);
+            match rt {
+                RegistryType::Docker => self.docker.enabled = on,
+                RegistryType::Maven => self.maven.enabled = on,
+                RegistryType::Npm => self.npm.enabled = on,
+                RegistryType::Cargo => self.cargo.enabled = on,
+                RegistryType::PyPI => self.pypi.enabled = on,
+                RegistryType::Go => self.go.enabled = on,
+                RegistryType::Raw => self.raw.enabled = on,
+                RegistryType::Gems => self.gems.enabled = on,
+                RegistryType::Terraform => self.terraform.enabled = on,
+                RegistryType::Ansible => self.ansible.enabled = on,
+                RegistryType::Nuget => self.nuget.enabled = on,
+                RegistryType::PubDart => self.pub_dart.enabled = on,
+                RegistryType::Conan => self.conan.enabled = on,
+                RegistryType::Rpm => self.rpm.enabled = on,
+                RegistryType::Deb => self.deb.enabled = on,
+                RegistryType::Cpan => self.cpan.enabled = on,
+                RegistryType::HuggingFace => self.hf.enabled = on,
+            }
+        }
+    }
+
+    /// Legacy registry resolution from individual `*.enabled` flags.
+    fn enabled_registries_legacy(&self) -> HashSet<RegistryType> {
+        let mut set = HashSet::new();
+        if self.docker.enabled {
+            set.insert(RegistryType::Docker);
+        }
+        if self.maven.enabled {
+            set.insert(RegistryType::Maven);
+        }
+        if self.npm.enabled {
+            set.insert(RegistryType::Npm);
+        }
+        if self.cargo.enabled {
+            set.insert(RegistryType::Cargo);
+        }
+        if self.pypi.enabled {
+            set.insert(RegistryType::PyPI);
+        }
+        if self.go.enabled {
+            set.insert(RegistryType::Go);
+        }
+        if self.raw.enabled {
+            set.insert(RegistryType::Raw);
+        }
+        if self.gems.enabled {
+            set.insert(RegistryType::Gems);
+        }
+        if self.terraform.enabled {
+            set.insert(RegistryType::Terraform);
+        }
+        if self.ansible.enabled {
+            set.insert(RegistryType::Ansible);
+        }
+        if self.nuget.enabled {
+            set.insert(RegistryType::Nuget);
+        }
+        if self.pub_dart.enabled {
+            set.insert(RegistryType::PubDart);
+        }
+        if self.conan.enabled {
+            set.insert(RegistryType::Conan);
+        }
+        if self.rpm.enabled {
+            set.insert(RegistryType::Rpm);
+        }
+        if self.deb.enabled {
+            set.insert(RegistryType::Deb);
+        }
+        if self.cpan.enabled {
+            set.insert(RegistryType::Cpan);
+        }
+        if self.hf.enabled {
+            set.insert(RegistryType::HuggingFace);
+        }
+        if set.is_empty() {
+            tracing::warn!("No registries enabled! All registries are disabled.");
+        }
+        set
+    }
+
+    /// Whether `rt` is an enabled registry with at least one upstream proxy configured.
+    ///
+    /// The `match` is exhaustive over [`RegistryType`], so adding a variant is a
+    /// compile error until its proxy shape is declared here — the single source of
+    /// truth for "is this an enabled proxy?". Raw has no upstream and is always false.
+    /// Per-registry shapes differ: most carry `proxy: Option<String>`, PyPI also has a
+    /// multi-upstream `proxies` list, Maven uses `proxies`, Docker uses `upstreams`.
+    /// The startup notice on `curation.mode` (#1135): none when curation is on or no proxy
+    /// registry is enabled; otherwise which registries are served unchecked, and whether `off`
+    /// was the operator's choice or only the default.
+    pub fn curation_mode_notice(&self) -> Option<CurationModeNotice> {
+        if self.curation.mode != CurationMode::Off {
+            return None;
+        }
+        let proxies: Vec<RegistryType> = RegistryType::all()
+            .iter()
+            .copied()
+            .filter(|&rt| self.is_enabled_proxy(rt))
+            .collect();
+        if proxies.is_empty() {
+            None
+        } else if self.curation.mode_explicit {
+            Some(CurationModeNotice::ExplicitOff(proxies))
+        } else {
+            Some(CurationModeNotice::Implicit(proxies))
+        }
+    }
+
+    fn is_enabled_proxy(&self, rt: RegistryType) -> bool {
+        match rt {
+            RegistryType::Docker => self.docker.enabled && !self.docker.upstreams.is_empty(),
+            RegistryType::Maven => self.maven.enabled && !self.maven.proxies.is_empty(),
+            RegistryType::Npm => self.npm.enabled && !self.npm.upstream_urls().is_empty(),
+            RegistryType::Cargo => self.cargo.enabled && self.cargo.proxy.is_some(),
+            RegistryType::PyPI => {
+                self.pypi.enabled && (self.pypi.proxy.is_some() || !self.pypi.proxies.is_empty())
+            }
+            RegistryType::Go => self.go.enabled && self.go.proxy.is_some(),
+            RegistryType::Raw => false, // raw file storage has no upstream
+            RegistryType::Gems => self.gems.enabled && self.gems.proxy.is_some(),
+            RegistryType::Terraform => self.terraform.enabled && self.terraform.proxy.is_some(),
+            RegistryType::Ansible => self.ansible.enabled && self.ansible.proxy.is_some(),
+            RegistryType::Nuget => self.nuget.enabled && self.nuget.proxy.is_some(),
+            RegistryType::PubDart => self.pub_dart.enabled && self.pub_dart.proxy.is_some(),
+            RegistryType::Conan => self.conan.enabled && self.conan.proxy.is_some(),
+            RegistryType::Rpm => self.rpm.enabled && !self.rpm.proxies.is_empty(),
+            RegistryType::Deb => self.deb.enabled && !self.deb.proxies.is_empty(),
+            RegistryType::Cpan => self.cpan.enabled && self.cpan.proxy.is_some(),
+            RegistryType::HuggingFace => self.hf.enabled && self.hf.proxy.is_some(),
+        }
+    }
+
+    /// The effective quarantine mode for `rt`: the per-registry override if set,
+    /// else the global `curation.quarantine`, else `Off`.
+    ///
+    /// The `match` is exhaustive over [`RegistryType`] and the precedence is
+    /// byte-identical to the handler resolution (`per.or(global)`, e.g.
+    /// `registry/docker.rs::resolve_quarantine`), so config validation and the
+    /// runtime DigestStore gate compute the SAME value and cannot diverge — that
+    /// divergence was the #765 bug (docker dropped from the hand-rolled chains).
+    /// `Raw` has no curation override and no quarantine-enforcing path → always
+    /// `Off` (counting it would be a phantom control: `any_quarantine_active`
+    /// true while nothing enforces).
+    fn quarantine_mode_for(&self, rt: RegistryType) -> crate::digest_quarantine::QuarantineMode {
+        use crate::digest_quarantine::QuarantineMode;
+        let global = self.curation.quarantine.as_ref();
+        let per = match rt {
+            RegistryType::Docker => self.curation.docker.quarantine.as_ref(),
+            RegistryType::Maven => self.curation.maven.quarantine.as_ref(),
+            RegistryType::Npm => self.curation.npm.quarantine.as_ref(),
+            RegistryType::Cargo => self.curation.cargo.quarantine.as_ref(),
+            RegistryType::PyPI => self.curation.pypi.quarantine.as_ref(),
+            RegistryType::Go => self.curation.go.quarantine.as_ref(),
+            RegistryType::Gems => self.curation.gems.quarantine.as_ref(),
+            RegistryType::Terraform => self.curation.terraform.quarantine.as_ref(),
+            RegistryType::Ansible => self.curation.ansible.quarantine.as_ref(),
+            RegistryType::Nuget => self.curation.nuget.quarantine.as_ref(),
+            RegistryType::PubDart => self.curation.pub_dart.quarantine.as_ref(),
+            RegistryType::Conan => self.curation.conan.quarantine.as_ref(),
+            RegistryType::Rpm => self.curation.rpm.quarantine.as_ref(),
+            RegistryType::Deb => self.curation.deb.quarantine.as_ref(),
+            // Raw is hosted-only: no curation override, no quarantine gate in
+            // its handlers (quarantine gates proxy downloads).
+            RegistryType::Raw => return QuarantineMode::Off,
+            RegistryType::Cpan => self.curation.cpan.quarantine.as_ref(),
+            // Hugging Face has no curation section and its handler no quarantine path
+            // (files are kept by the digest the Hub names and checked on the way in), so
+            // nothing in it enforces a quarantine; counting it would be the same phantom
+            // control as Raw.
+            RegistryType::HuggingFace => return QuarantineMode::Off,
+        };
+        per.or(global).cloned().unwrap_or(QuarantineMode::Off)
+    }
+
+    /// Whether any registry has an effective quarantine mode other than `Off`.
+    ///
+    /// Single source of truth for both config validation (the #741 min-release-age
+    /// guard and the enforce "at least one control" check) and the runtime
+    /// DigestStore gate in `main.rs`. Because it folds [`Self::quarantine_mode_for`]
+    /// over [`RegistryType::all`], a per-registry quarantine (e.g. docker-only)
+    /// counts everywhere it should: the durable store is loaded iff some registry
+    /// actually enforces, closing the #765 fail-open where a docker-only quarantine
+    /// got an empty (non-durable) store.
+    pub(crate) fn any_quarantine_active(&self) -> bool {
+        use crate::digest_quarantine::QuarantineMode;
+        RegistryType::all()
+            .iter()
+            .any(|&rt| self.quarantine_mode_for(rt) != QuarantineMode::Off)
+    }
+
+    /// What startup knows about `rt` for its own `min_release_age`; the verdict is
+    /// [`registry_min_age_verdict`] of these facts (#1098).
+    fn registry_min_age_facts(&self, rt: RegistryType) -> RegistryMinAgeFacts {
+        RegistryMinAgeFacts {
+            value_set: self
+                .curation
+                .registry_override(rt)
+                .is_some_and(|o| o.min_release_age.is_some()),
+            dated: release_date_check(rt),
+            enabled: self.enabled_registries_legacy().contains(&rt),
+            proxy: self.is_enabled_proxy(rt),
+            quarantined: self.quarantine_mode_for(rt)
+                != crate::digest_quarantine::QuarantineMode::Off,
+        }
+    }
+
+    /// Warn if legacy NORA_*_ENABLED env vars are set while using the new
+    /// `[registries].enable` or `NORA_REGISTRIES_ENABLE`.
+    fn warn_legacy_env_vars_if_present() {
+        // Every registry's flag: the hand-written list left out rpm, deb, cpan and hf, so
+        // NORA_HF_ENABLED=true beside an enable-set was ignored without a word.
+        let legacy_vars: Vec<&str> = RegistryType::all()
+            .iter()
+            .map(|&rt| legacy_enable_var(rt))
+            .collect();
+        let found: Vec<&str> = legacy_vars
+            .iter()
+            .filter(|v| env::var(v).is_ok())
+            .copied()
+            .collect();
+        if !found.is_empty() {
+            tracing::warn!(
+                vars = ?found,
+                "Legacy NORA_*_ENABLED env vars are set but ignored — \
+                 [registries].enable or NORA_REGISTRIES_ENABLE takes precedence"
+            );
+        }
+    }
+
+    /// Warn if credentials are configured via config.toml (not env vars)
+    pub fn warn_plaintext_credentials(&self) {
+        // Docker upstreams
+        for (i, upstream) in self.docker.upstreams.iter().enumerate() {
+            if upstream.auth.is_some()
+                && std::env::var("NORA_DOCKER_PROXIES").is_err()
+                && std::env::var("NORA_DOCKER_UPSTREAMS").is_err()
+            {
+                tracing::warn!(
+                    upstream_index = i,
+                    url = %upstream.url,
+                    "Docker upstream credentials in config.toml are plaintext — consider NORA_DOCKER_PROXIES env var"
+                );
+            }
+        }
+        // Maven proxies
+        for proxy in &self.maven.proxies {
+            if proxy.auth().is_some() && std::env::var("NORA_MAVEN_PROXIES").is_err() {
+                tracing::warn!(
+                    url = %proxy.url(),
+                    "Maven proxy credentials in config.toml are plaintext — consider NORA_MAVEN_PROXIES env var"
+                );
+            }
+        }
+        // Go
+        if self.go.proxy_auth.is_some() && std::env::var("NORA_GO_PROXY_AUTH").is_err() {
+            tracing::warn!("Go proxy credentials in config.toml are plaintext — consider NORA_GO_PROXY_AUTH env var");
+        }
+        // npm
+        if self.npm.proxy_auth.is_some() && std::env::var("NORA_NPM_PROXY_AUTH").is_err() {
+            tracing::warn!("npm proxy credentials in config.toml are plaintext — consider NORA_NPM_PROXY_AUTH env var");
+        }
+        // npm multi-upstream (#1055): Basic `auth` on an entry is plaintext; Bearer is env-only.
+        for proxy in &self.npm.proxies {
+            if let NpmProxyEntry::Full(p) = proxy {
+                if p.auth.is_some() {
+                    tracing::warn!(
+                        url = %p.url,
+                        "npm upstream credentials in config.toml are plaintext — consider auth_bearer_env"
+                    );
+                }
+            }
+        }
+        // PyPI
+        if self.pypi.proxy_auth.is_some() && std::env::var("NORA_PYPI_PROXY_AUTH").is_err() {
+            tracing::warn!("PyPI proxy credentials in config.toml are plaintext — consider NORA_PYPI_PROXY_AUTH env var");
+        }
+        // PyPI multi-upstream proxies (#663)
+        for proxy in &self.pypi.proxies {
+            if proxy.auth().is_some() && std::env::var("NORA_PYPI_PROXIES").is_err() {
+                tracing::warn!(
+                    url = %proxy.url(),
+                    "PyPI upstream credentials in config.toml are plaintext — consider NORA_PYPI_PROXIES env var"
+                );
+            }
+        }
+        // Cargo
+        if self.cargo.proxy_auth.is_some() && std::env::var("NORA_CARGO_PROXY_AUTH").is_err() {
+            tracing::warn!("Cargo proxy credentials in config.toml are plaintext — consider NORA_CARGO_PROXY_AUTH env var");
+        }
+        // Auth posture: a silently-unauthenticated instance must not look safe.
+        // The zero-config default is auth.enabled=false, which accepts BOTH reads
+        // and writes from anyone; surface it loudly so it is a deliberate choice.
+        if !self.auth.enabled {
+            tracing::warn!(
+                "auth.enabled=false — NORA is accepting UNAUTHENTICATED reads AND writes. \
+                 Set auth.enabled=true (with htpasswd/tokens/OIDC) before exposing this instance."
+            );
+        } else if self.auth.anonymous_read {
+            tracing::warn!(
+                "auth.anonymous_read=true — pulls/downloads are served without authentication \
+                 (writes still require a token); ensure this is intended for this deployment."
+            );
+        }
+        // Independent of anonymous_read: anonymous Docker pull serves container
+        // images to anyone (push still requires auth). Surface it on its own.
+        if self.auth.enabled && self.auth.docker_anon_pull {
+            tracing::warn!(
+                "auth.docker_anon_pull=true — Docker/OCI images are served on anonymous \
+                 `docker pull` without authentication (push still requires a token); ensure this \
+                 is intended for this deployment."
+            );
+        }
+    }
+
+    /// Collect all configured upstream hostnames for leak detection (#386).
+    ///
+    /// Returns `(registry_name, hostname)` pairs extracted from proxy URLs.
+    /// Used once at startup to pre-compile substring searchers.
+    pub fn upstream_hostnames(&self) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+
+        let extract_host = |url: &str| -> Option<String> {
+            let without_scheme = url
+                .strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"))
+                .unwrap_or(url);
+            let host = without_scheme.split('/').next()?;
+            let host = host.split(':').next()?;
+            if host.is_empty() || host == "localhost" || host == "127.0.0.1" {
+                return None;
+            }
+            Some(host.to_lowercase())
+        };
+
+        // Simple proxy: Option<String>
+        let simple = [
+            ("cargo", self.cargo.proxy.as_deref()),
+            ("go", self.go.proxy.as_deref()),
+            ("gems", self.gems.proxy.as_deref()),
+            ("terraform", self.terraform.proxy.as_deref()),
+            ("ansible", self.ansible.proxy.as_deref()),
+            ("nuget", self.nuget.proxy.as_deref()),
+            ("pub", self.pub_dart.proxy.as_deref()),
+            ("conan", self.conan.proxy.as_deref()),
+            ("cpan", self.cpan.proxy.as_deref()),
+            // Not hf: its metadata carries the Hub's host as content (a model card's
+            // `license_link`), so a body scan reports leaks that are not; the URLs NORA
+            // hands an hf client travel in headers, which the handler lists by name.
+        ];
+        for (name, url) in simple {
+            if let Some(url) = url {
+                if let Some(host) = extract_host(url) {
+                    result.push((name.to_string(), host));
+                }
+            }
+        }
+        // npm: every upstream, private ones included (#1055) — a private registry
+        // host in a served packument is exactly the leak this list exists to catch.
+        for url in self.npm.upstream_urls() {
+            if let Some(host) = extract_host(url) {
+                result.push((RegistryType::Npm.as_str().to_string(), host));
+            }
+        }
+
+        // NuGet extra search/autocomplete URLs
+        if let Some(host) = extract_host(&self.nuget.search_service) {
+            result.push((
+                crate::registry_type::RegistryType::Nuget
+                    .as_str()
+                    .to_string(),
+                host,
+            ));
+        }
+        if let Some(host) = extract_host(&self.nuget.autocomplete) {
+            result.push((
+                crate::registry_type::RegistryType::Nuget
+                    .as_str()
+                    .to_string(),
+                host,
+            ));
+        }
+
+        // Docker upstreams: Vec<DockerUpstream>
+        for upstream in &self.docker.upstreams {
+            if let Some(host) = extract_host(&upstream.url) {
+                result.push((
+                    crate::registry_type::RegistryType::Docker
+                        .as_str()
+                        .to_string(),
+                    host,
+                ));
+            }
+        }
+
+        // Maven proxies: Vec<MavenProxyEntry>
+        for proxy in &self.maven.proxies {
+            if let Some(host) = extract_host(proxy.url()) {
+                result.push((
+                    crate::registry_type::RegistryType::Maven
+                        .as_str()
+                        .to_string(),
+                    host,
+                ));
+            }
+        }
+
+        // RPM/DEB per-repo proxies: BTreeMap<repo, RepoProxyEntry>
+        for (name, proxies) in [("rpm", &self.rpm.proxies), ("deb", &self.deb.proxies)] {
+            for entry in proxies.values() {
+                if let Some(host) = extract_host(entry.url()) {
+                    result.push((name.to_string(), host));
+                }
+            }
+        }
+
+        // PyPI upstreams: Vec<PypiProxyEntry> via upstreams() so the multi-upstream
+        // list (#663) AND the legacy single `proxy` are both registered with the
+        // leak detector — otherwise a secondary upstream's host (e.g. an internal
+        // mirror with embedded credentials) would be invisible to leak scanning.
+        for up in self.pypi.upstreams() {
+            if let Some(host) = extract_host(up.url()) {
+                result.push((
+                    crate::registry_type::RegistryType::PyPI
+                        .as_str()
+                        .to_string(),
+                    host,
+                ));
+            }
+        }
+
+        // Deduplicate
+        result.sort();
+        result.dedup();
+        result
+    }
+
+    /// Validate configuration and return (warnings, errors).
+    ///
+    /// Warnings are logged but do not prevent startup.
+    /// Errors indicate a fatal misconfiguration and should cause a panic.
+    pub fn validate(&self) -> (Vec<String>, Vec<String>) {
+        self.validate_with_config_path(env::var("NORA_CONFIG_PATH").ok())
+    }
+
+    /// True if `host` is a loopback address (the 127.0.0.0/8 block or ::1) or
+    /// the `localhost` hostname (case-insensitive). Used to warn when a service
+    /// index would be built from a loopback bind address, unreachable by remote
+    /// clients (#590). Callers passing a URL host must strip IPv6 brackets first
+    /// (`url::host_str()` returns "[::1]", which does not parse as an `IpAddr`).
+    pub(crate) fn is_loopback_host(host: &str) -> bool {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false)
+    }
+
+    /// Validate configuration with explicit config_path to avoid env var
+    /// dependency in tests (env vars are process-global, tests run in parallel).
+    pub fn validate_with_config_path(
+        &self,
+        config_path: Option<String>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+
+        // 1. Port must not be 0
+        if self.server.port == 0 {
+            errors.push("server.port must not be 0".to_string());
+        }
+
+        // 1b. Wildcard host requires public_url (non-routable address → broken client URLs)
+        {
+            let host = &self.server.host;
+            let is_wildcard = host == "0.0.0.0" || host == "::" || host == "0:0:0:0:0:0:0:0";
+
+            if is_wildcard && self.server.public_url.is_none() {
+                errors.push(format!(
+                    "NORA_PUBLIC_URL is required when host is '{}' (not routable). \
+                     Set: NORA_PUBLIC_URL=http://your-registry:{}",
+                    host, self.server.port
+                ));
+            }
+        }
+
+        // 1c. Validate public_url format if set
+        if let Some(ref url_str) = self.server.public_url {
+            match reqwest::Url::parse(url_str) {
+                Ok(parsed) => {
+                    let scheme = parsed.scheme();
+                    if scheme != "http" && scheme != "https" {
+                        errors.push(format!(
+                            "NORA_PUBLIC_URL must use http:// or https:// scheme, got: '{}'",
+                            scheme
+                        ));
+                    }
+                    // public_url explicitly set to a loopback host is also broken for
+                    // remote clients — the operator configured the footgun directly (#590).
+                    // host_str() returns IPv6 literals with brackets ("[::1]"), which do
+                    // not parse as an IpAddr — strip them before the loopback check.
+                    if let Some(h) = parsed.host_str() {
+                        let h = h.trim_start_matches('[').trim_end_matches(']');
+                        if Self::is_loopback_host(h) {
+                            warnings.push(format!(
+                                "NORA_PUBLIC_URL points at loopback ('{}') — clients behind a \
+                                 reverse proxy cannot reach it. Use the externally-reachable \
+                                 hostname, e.g. https://registry.example.com",
+                                h
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!(
+                        "NORA_PUBLIC_URL is not a valid URL: '{}' — {}",
+                        url_str, e
+                    ));
+                }
+            }
+        }
+
+        // 2. Storage path must not be empty when mode = Local
+        if self.storage.mode == StorageMode::Local && self.storage.path.trim().is_empty() {
+            errors.push("storage.path must not be empty when storage mode is local".to_string());
+        }
+
+        // 3. Bucket must not be empty when mode = S3 or GCS
+        if matches!(self.storage.mode, StorageMode::S3 | StorageMode::Gcs)
+            && self.storage.bucket.trim().is_empty()
+        {
+            errors.push(
+                "storage.bucket must not be empty when storage mode is s3 or gcs".to_string(),
+            );
+        }
+
+        // 4. Rate limit values must be > 0 when rate limiting is enabled
+        if self.rate_limit.enabled {
+            if self.rate_limit.auth_rps == 0 {
+                warnings
+                    .push("rate_limit.auth_rps is 0 while rate limiting is enabled".to_string());
+            }
+            if self.rate_limit.auth_burst == 0 {
+                warnings
+                    .push("rate_limit.auth_burst is 0 while rate limiting is enabled".to_string());
+            }
+            if self.rate_limit.upload_rps == 0 {
+                warnings
+                    .push("rate_limit.upload_rps is 0 while rate limiting is enabled".to_string());
+            }
+            if self.rate_limit.upload_burst == 0 {
+                warnings.push(
+                    "rate_limit.upload_burst is 0 while rate limiting is enabled".to_string(),
+                );
+            }
+            if self.rate_limit.general_rps == 0 {
+                warnings
+                    .push("rate_limit.general_rps is 0 while rate limiting is enabled".to_string());
+            }
+            if self.rate_limit.general_burst == 0 {
+                warnings.push(
+                    "rate_limit.general_burst is 0 while rate limiting is enabled".to_string(),
+                );
+            }
+        }
+
+        // 5. Body limit must be > 0
+        if self.server.body_limit_mb == 0 {
+            warnings
+                .push("server.body_limit_mb is 0, no request bodies will be accepted".to_string());
+        }
+
+        // 6. Relative paths — may resolve unexpectedly.
+        // The storage.path hint is scoped to explicit-config starts, to avoid noise
+        // on the relative default of a bare `nora serve`.
+        if config_path.is_some()
+            && self.storage.mode == StorageMode::Local
+            && !self.storage.path.starts_with('/')
+        {
+            warnings.push(format!(
+                "storage.path=\"{}\" is relative — will resolve from CWD. Use absolute path for predictable behavior",
+                self.storage.path
+            ));
+        }
+        // The token_storage hint fires whenever auth is enabled with a relative
+        // path, regardless of config source: env-only (systemd) starts have
+        // config_path=None yet are exactly where a relative token_storage resolves
+        // outside ReadWritePaths and breaks token writes (#816).
+        if self.auth.enabled && !self.auth.token_storage.starts_with('/') {
+            warnings.push(format!(
+                "auth.token_storage=\"{}\" is relative — will resolve from CWD (under systemd it \
+                 resolves outside ReadWritePaths and token writes fail). Set an absolute path, e.g. \
+                 NORA_AUTH_TOKEN_STORAGE=/var/lib/nora/tokens",
+                self.auth.token_storage
+            ));
+        }
+
+        // 7. Trusted proxies /0 — security footgun
+        if self.auth.trusted_proxies.has_prefix_zero() {
+            warnings.push(
+                "auth.trusted_proxies contains a /0 CIDR — all peers are trusted proxies. \
+                 X-Forwarded-For will be honored from any source, disabling IP-based brute-force protection"
+                    .to_string(),
+            );
+        }
+
+        // 8. "Enabled but empty" — subsystems that silently do nothing
+        if self.gc.enabled && self.gc.dry_run {
+            warnings.push(
+                "gc.enabled=true with gc.dry_run=true — GC will run but never delete anything. Set gc.dry_run=false to actually free space".to_string(),
+            );
+        }
+        if self.retention.enabled && self.retention.dry_run && !self.retention.rules.is_empty() {
+            warnings.push(
+                "retention.enabled=true with retention.dry_run=true — retention will run but never delete anything. Set retention.dry_run=false to actually enforce policies".to_string(),
+            );
+        }
+        if self.retention.enabled && self.retention.rules.is_empty() {
+            warnings.push(
+                "retention.enabled=true but no retention rules configured — retention scheduler will run but do nothing. Add [retention.rules] or set retention.enabled=false".to_string(),
+            );
+        }
+
+        // 8. Curation validation.
+        // Compute once: is any first-seen quarantine active (global or per-registry)?
+        // Used by both the enforce "at least one control" check and the
+        // min-release-age age-control requirement below.
+        // Exhaustive over RegistryType via any_quarantine_active (a compiler-enforced
+        // match): the hand-rolled OR-chain here previously omitted docker, so a
+        // docker-only [curation.docker] quarantine read as "inactive" and falsely
+        // failed this validation (#765). Counts a registry iff its effective mode
+        // (per-registry override .or(global)) is not Off — the same value the
+        // handlers and the main.rs store gate use.
+        let quarantine_active = self.any_quarantine_active();
+
+        // Every curation duration parses, in every mode: a typo in one is a
+        // configuration error naming it, never a silent default (#1099).
+        errors.extend(self.curation.duration_errors());
+
+        // Enforce mode must have at least ONE active control, otherwise it blocks
+        // nothing. An allowlist is one option, not the only one — a blocklist,
+        // min-release-age, an active quarantine, namespace isolation, or integrity
+        // checking each make enforce meaningful, so a deny-list-only / age-only /
+        // quarantine-only policy is valid (#740).
+        // A per-registry min_release_age is a control on its own when it applies
+        // (#1098): not on a disabled registry, nor where it is refused below.
+        let any_registry_min_age = RegistryType::all().iter().any(|&rt| {
+            registry_min_age_verdict(self.registry_min_age_facts(rt))
+                == RegistryMinAgeVerdict::Applies
+        });
+        // require_integrity asks for an integrity hash on every allowlist entry; the allowlist
+        // filter is its only reader. Without an allowlist it holds nothing, so it is refused
+        // instead of counted as a control (enforce with it alone used to start and block nothing).
+        if self.curation.require_integrity && self.curation.allowlist_path.is_none() {
+            errors.push(
+                "curation.require_integrity is set, but it applies only to allowlist entries (an integrity hash on each) and curation.allowlist_path is not set, so it would hold nothing. Set curation.allowlist_path, or unset require_integrity.".to_string(),
+            );
+        }
+        if self.curation.mode == CurationMode::Enforce {
+            let any_control = self.curation.allowlist_path.is_some()
+                || self.curation.blocklist_path.is_some()
+                || self.curation.min_release_age.is_some()
+                || any_registry_min_age
+                || quarantine_active
+                || !self.curation.internal_namespaces.is_empty();
+            if !any_control {
+                errors.push(
+                    "curation.mode=enforce but no active control is configured — enforce would block nothing. Set at least one of: allowlist_path, blocklist_path, min_release_age, quarantine, or internal_namespaces.".to_string(),
+                );
+            }
+            if let Some(ref path) = self.curation.allowlist_path {
+                if !std::path::Path::new(path).exists() {
+                    errors.push(format!(
+                        "curation.allowlist_path=\"{}\" does not exist (required for enforce mode)",
+                        path
+                    ));
+                }
+            }
+        }
+        if self.curation.bypass_token.is_some() && env::var("NORA_CURATION_BYPASS_TOKEN").is_err() {
+            warnings.push(
+                "curation.bypass_token is set in config file — consider using NORA_CURATION_BYPASS_TOKEN env var instead".to_string(),
+            );
+        }
+        if self.curation.mode == CurationMode::Audit && self.curation.allowlist_path.is_none() {
+            warnings.push(
+                "curation.mode=audit but no allowlist_path configured — no allowlist filter will be active".to_string(),
+            );
+        }
+        if self.curation.on_failure != CurationOnFailure::Closed {
+            errors.push(
+                "curation.on_failure=\"open\" is not implemented and would silently degrade to fail-closed. Remove the setting or set on_failure=\"closed\" explicitly. This field will be removed in v0.9".to_string(),
+            );
+        }
+        // min_release_age on a proxy registry requires an active quarantine. On the
+        // proxy path the upstream publish date is unsigned/spoofable AND, for most
+        // registries, not resolvable at all (the date-bearing upstream metadata is
+        // not cached at the curation point — the same root cause as #741), so
+        // min-age DEFERS (Skip). server.trust_upstream_dates yields a real date only
+        // where the registry caches one (npm); for pypi/cargo/nuget/gems/… it stays
+        // None and min-age silently does nothing — so trust is NOT a sufficient age
+        // control, only the unspoofable quarantine is. Refuse min-age on an enabled
+        // proxy without a quarantine (curation-minage-real-age-defer, #741).
+        {
+            // Exhaustive over RegistryType via is_enabled_proxy (a compiler-enforced
+            // match): adding a registry variant forces a new arm, so this guard can
+            // never silently forget one again. The hand-rolled list here previously
+            // omitted docker, leaving a docker-only proxy with min_release_age and no
+            // quarantine unwarned (#741 follow-up).
+            let any_enabled_proxy = RegistryType::all()
+                .iter()
+                .any(|&rt| self.is_enabled_proxy(rt));
+            if self.curation.min_release_age.is_some() && !quarantine_active && any_enabled_proxy {
+                errors.push(
+                    "curation.min_release_age is set with an enabled proxy registry but no age control would be active: on the proxy path an upstream publish date is unsigned/spoofable and is not resolved for most registries, so min-release-age silently does nothing without a quarantine. Enable curation.quarantine=\"observe\"|\"enforce\" (the unspoofable first-seen age control). server.trust_upstream_dates enhances min-release-age with real upstream dates where a registry caches one (e.g. npm) but is NOT a substitute for the quarantine. (#741)".to_string(),
+                );
+            }
+            // A registry's own value applies without a global one (#1098). What startup
+            // does with it is registry_min_age_verdict of the registry's facts: it needs
+            // a quarantine of that registry — its own or the global one — when that
+            // registry is an enabled proxy (a quarantine on another registry holds none
+            // of its downloads, and trusted upstream dates are no substitute, #741); it
+            // can never apply where the downloads carry no release date; on a disabled
+            // registry it holds nothing.
+            for &rt in RegistryType::all() {
+                let Some(age) = self
+                    .curation
+                    .registry_override(rt)
+                    .and_then(|o| o.min_release_age.as_deref())
+                else {
+                    continue;
+                };
+                match registry_min_age_verdict(self.registry_min_age_facts(rt)) {
+                    RegistryMinAgeVerdict::NotSet | RegistryMinAgeVerdict::Applies => {}
+                    RegistryMinAgeVerdict::CannotApply => {
+                        let why = match release_date_check(rt) {
+                            ReleaseDateCheck::NoNameOrDate => format!(
+                                "{rt} downloads are not checked by name or release date. Remove it; curation.{rt}.quarantine holds new {rt} packages"
+                            ),
+                            ReleaseDateCheck::NoDate | ReleaseDateCheck::Dated => format!(
+                                "{rt} downloads carry no release date to check. Remove it; a quarantine holds new {rt} packages"
+                            ),
+                        };
+                        errors.push(format!(
+                            "curation.{rt}.min_release_age=\"{age}\" cannot apply: {why}. (#1098)"
+                        ));
+                    }
+                    RegistryMinAgeVerdict::Unused => warnings.push(format!(
+                        "curation.{rt}.min_release_age=\"{age}\" is set but {rt} is not enabled: it holds nothing and is not an active control. (#1098)"
+                    )),
+                    RegistryMinAgeVerdict::NeedsQuarantine => errors.push(format!(
+                        "curation.{rt}.min_release_age=\"{age}\" is set and {rt} is an enabled proxy registry, but no age control would be active: on the proxy path an upstream publish date is unsigned/spoofable and is not resolved for most registries, so min-release-age silently does nothing without a quarantine of {rt} (one on another registry does not hold {rt} downloads). Enable curation.quarantine or curation.{rt}.quarantine=\"observe\"|\"enforce\". (#741, #1098)"
+                    )),
+                }
+            }
+        }
+
+        // Hugging Face: a Hub commit has no publish date NORA reads, and hf has no quarantine
+        // path, so min_release_age would hold nothing there — refused rather than ignored
+        // (hf-curation-applies).
+        if self.curation.min_release_age.is_some()
+            && self.is_enabled_proxy(RegistryType::HuggingFace)
+        {
+            errors.push(
+                "curation.min_release_age cannot hold the Hugging Face proxy: a Hub commit has no publish date NORA reads, and hf has no quarantine path. Unset curation.min_release_age, or disable [hf]. (#579)".to_string(),
+            );
+        }
+        // Hugging Face has no curation section of its own, so NORA_CURATION_HF_* is read by
+        // nothing: refused rather than ignored, as [curation.hf] is at load.
+        for var in hf_curation_env_vars() {
+            if env::var(var).is_ok() {
+                errors.push(hf_curation_refusal(var));
+            }
+        }
+
+        // A redirect of a Hugging Face file request leaves the upstream only for these hosts.
+        for host in self.hf.invalid_cdn_hosts() {
+            errors.push(format!(
+                "hf.cdn_hosts entry {host:?} is not a host name or IP address (no scheme, port, path or wildcard): it names the hosts a file request's redirect may go to"
+            ));
+        }
+
+        // 9. Docker upstream prefix validation
+        {
+            const RESERVED_PREFIXES: &[&str] =
+                &["blobs", "manifests", "tags", "uploads", "_catalog", "v2"];
+            let mut seen_prefixes = std::collections::HashSet::new();
+            for (i, upstream) in self.docker.upstreams.iter().enumerate() {
+                if let Some(ref prefix) = upstream.prefix {
+                    if prefix.is_empty() {
+                        errors.push(format!(
+                            "docker.upstreams[{}]: prefix must not be empty (omit the field instead)",
+                            i
+                        ));
+                    } else if prefix.contains('/') {
+                        errors.push(format!(
+                            "docker.upstreams[{}]: prefix \"{}\" must not contain '/'",
+                            i, prefix
+                        ));
+                    } else if prefix != &prefix.to_lowercase() {
+                        errors.push(format!(
+                            "docker.upstreams[{}]: prefix \"{}\" must be lowercase (Docker names are lowercase)",
+                            i, prefix
+                        ));
+                    } else if RESERVED_PREFIXES.contains(&prefix.as_str()) {
+                        errors.push(format!(
+                            "docker.upstreams[{}]: prefix \"{}\" is a reserved Docker API path segment",
+                            i, prefix
+                        ));
+                    } else if !seen_prefixes.insert(prefix.clone()) {
+                        errors.push(format!(
+                            "docker.upstreams[{}]: duplicate prefix \"{}\"",
+                            i, prefix
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 9b. Docker default_action=deny without any prefixed upstream is a no-op trap
+        if self.docker.default_action == DefaultAction::Deny
+            && self.docker.enabled
+            && !self.docker.upstreams.iter().any(|u| u.prefix.is_some())
+        {
+            warnings.push(
+                "docker.default_action=\"deny\" but no upstream has a prefix configured — \
+                 all requests will be denied. Add prefix= to at least one [[docker.upstreams]]"
+                    .to_string(),
+            );
+        }
+
+        // 9c. npm multi-upstream (#1055): scope ownership, one default, credentials
+        {
+            let (w, e) = self.npm.proxies_problems();
+            warnings.extend(w);
+            errors.extend(e);
+        }
+
+        // 10. [registries].enable validation
+        if let Some(ref section) = self.registries {
+            if let Some(ref spec) = section.enable {
+                if let Err(e) = spec.resolve() {
+                    errors.push(format!("[registries].enable: {}", e));
+                }
+            }
+        }
+
+        (warnings, errors)
+    }
+
+    /// Load configuration with priority: ENV > config file > defaults
+    ///
+    /// Config file resolution order:
+    /// 1. `NORA_CONFIG_PATH` env var (fatal if set but file not found)
+    /// 2. `config.toml` in current working directory (optional)
+    /// 3. Built-in defaults
+    ///
+    /// A configuration NORA cannot start with is an error, for the caller to report and
+    /// exit on with [`EXIT_CONFIG`].
+    pub fn load() -> Result<Self, ConfigLoadError> {
+        let (config, _unknown_keys) = Self::load_from(
+            env::var("NORA_CONFIG_PATH").ok(),
+            DEFAULT_CONFIG_FILE,
+            config_strict_from_env(),
+        )?;
+        Ok(config)
+    }
+
+    /// [`Config::load`] with `NORA_CONFIG_PATH`, the fallback file and `NORA_CONFIG_STRICT`
+    /// passed in, so tests can drive it without setting process-wide state that `validate`
+    /// also reads. Also returns the unknown keys of the file it read: logged once, or
+    /// refused in strict mode.
+    fn load_from(
+        config_path: Option<String>,
+        fallback: &str,
+        strict: bool,
+    ) -> Result<(Self, Vec<String>), ConfigLoadError> {
+        let mut unknown_keys = Vec::new();
+        // 1. Start with defaults
+        // 2. Override with config file if exists
+        let mut config: Config = if let Some(config_path) = config_path {
+            let content =
+                fs::read_to_string(&config_path).map_err(|source| ConfigLoadError::Unreadable {
+                    path: config_path.clone(),
+                    source,
+                })?;
+            let (cfg, unknown) =
+                parse_config(&content).map_err(|source| ConfigLoadError::InvalidToml {
+                    path: config_path.clone(),
+                    source,
+                })?;
+            refuse_hf_curation_keys(&config_path, &unknown)?;
+            unknown_keys = surface_unknown_keys(&config_path, unknown, strict)?;
+            tracing::info!(path = %config_path, "Loaded config from NORA_CONFIG_PATH");
+            cfg
+        } else {
+            match fs::read_to_string(fallback) {
+                Ok(content) => match parse_config(&content) {
+                    Ok((cfg, unknown)) => {
+                        refuse_hf_curation_keys(fallback, &unknown)?;
+                        unknown_keys = surface_unknown_keys(fallback, unknown, strict)?;
+                        tracing::info!(path = %fallback, "Loaded config");
+                        cfg
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %fallback, error = %e, "config exists but contains invalid TOML, using defaults");
+                        Config::default()
+                    }
+                },
+                Err(_) => Config::default(),
+            }
+        };
+
+        // 3. Override with ENV vars (highest priority)
+        config
+            .apply_env_overrides()
+            .map_err(ConfigLoadError::EnvOverride)?;
+
+        // 4. The per-registry `enabled` flags follow the enable-set (NORA_REGISTRIES_ENABLE,
+        //    [registries].enable) before validation, so every rule that reads them or
+        //    is_enabled_proxy judges the registries the server mounts (#1098). main applies
+        //    the same set again at start; it is idempotent.
+        let set = config.enabled_registries_quiet();
+        config.apply_enabled_registries(&set);
+
+        // 5. Validate configuration
+        Ok((config.checked()?, unknown_keys))
+    }
+
+    /// Validate: warnings are logged, errors reject the configuration.
+    fn checked(mut self) -> Result<Self, ConfigLoadError> {
+        if self.server.public_url.is_none() {
+            self.server.public_url =
+                Some(format!("http://{}:{}", self.server.host, self.server.port));
+        }
+        let (warnings, errors) = self.validate();
+        for w in &warnings {
+            tracing::warn!("Config validation: {}", w);
+        }
+        if !errors.is_empty() {
+            for e in &errors {
+                tracing::error!("Config validation: {}", e);
+            }
+            return Err(ConfigLoadError::Invalid(errors));
+        }
+        Ok(self)
+    }
+
+    /// Non-panicking config reload for SIGHUP handler.
+    /// Returns Err on invalid file/TOML/validation instead of panicking.
+    pub fn try_load() -> Result<Self, String> {
+        let file = match env::var("NORA_CONFIG_PATH") {
+            Ok(path) => {
+                let content = fs::read_to_string(&path)
+                    .map_err(|e| format!("Cannot read {}: {}", path, e))?;
+                Some((path, content))
+            }
+            Err(_) => fs::read_to_string(DEFAULT_CONFIG_FILE)
+                .ok()
+                .map(|content| (DEFAULT_CONFIG_FILE.to_string(), content)),
+        };
+        // one path for both sources, so neither can skip the unknown-key check
+        let mut config: Config = match file {
+            Some((path, content)) => {
+                let (config, unknown) = parse_config(&content)
+                    .map_err(|e| format!("Invalid TOML in {}: {}", path, e))?;
+                surface_unknown_keys(&path, unknown, config_strict_from_env())
+                    .map_err(|e| format!("Reload refused: {}", e))?;
+                config
+            }
+            None => Config::default(),
+        };
+        config.apply_env_overrides()?;
+        // As in `load`: validation judges the registries the enable-set mounts (#1098).
+        let set = config.enabled_registries_quiet();
+        config.apply_enabled_registries(&set);
+        let (_, errors) = config.validate();
+        if !errors.is_empty() {
+            return Err(format!("Validation errors: {}", errors.join("; ")));
+        }
+        Ok(config)
+    }
+
+    /// Apply environment variable overrides.
+    ///
+    /// Returns `Err` if a security-critical enum (curation mode, quarantine mode,
+    /// audit mode, storage mode) has an unrecognized value — typos must not silently
+    /// disable security or misconfigure storage.
+    fn apply_env_overrides(&mut self) -> Result<(), String> {
+        // Server + TLS
+        self.server.apply_env_overrides();
+        self.tls.apply_env_overrides();
+
+        // Storage (fail-closed: unknown NORA_STORAGE_MODE is fatal)
+        self.storage.apply_env_overrides()?;
+
+        // Auth
+        self.auth.apply_env_overrides();
+
+        // Registry configs (each handles its own NORA_*_ENABLED + format-specific vars)
+        self.docker.apply_env_overrides();
+        self.maven.apply_env_overrides();
+        self.npm.apply_env_overrides();
+        self.pypi.apply_env_overrides();
+        self.go.apply_env_overrides();
+        self.cargo.apply_env_overrides();
+        self.raw.apply_env_overrides();
+        self.gems.apply_env_overrides();
+        self.terraform.apply_env_overrides();
+        self.ansible.apply_env_overrides();
+        self.nuget.apply_env_overrides();
+        self.pub_dart.apply_env_overrides();
+        self.conan.apply_env_overrides();
+        self.rpm.apply_env_overrides();
+        self.deb.apply_env_overrides();
+        self.cpan.apply_env_overrides();
+        self.hf.apply_env_overrides();
+
+        // Rate limit, GC, retention
+        self.rate_limit.apply_env_overrides();
+        self.signing.apply_env_overrides();
+        self.gc.apply_env_overrides();
+        self.retention.apply_env_overrides();
+        self.watch.apply_env_overrides();
+
+        // Secrets — SecretsConfig lives in crate::secrets, no apply_env_overrides method
+        if let Ok(val) = env::var("NORA_SECRETS_PROVIDER") {
+            self.secrets.provider = val;
+        }
+        if let Ok(val) = env::var("NORA_SECRETS_CLEAR_ENV") {
+            self.secrets.clear_env = val.to_lowercase() == "true" || val == "1";
+        }
+
+        // Security-critical: parse errors are fatal (fail-fatal security enums)
+        self.curation.apply_env_overrides()?;
+        self.circuit_breaker.apply_env_overrides();
+        self.audit.apply_env_overrides()?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::digest_quarantine::QuarantineMode;
+    use crate::secrets::ProtectedString;
+    use crate::test_env::env_lock;
+
+    /// #1135: whether `curation.mode` was written down is read from the file and from
+    /// `NORA_CURATION_MODE`; the startup notice follows it while proxy registries are enabled.
+    #[test]
+    fn curation_mode_notice_tells_the_default_from_the_operators_off() {
+        let _lock = env_lock();
+        let (written, _) = parse_config("[curation]\nmode = \"off\"\n").unwrap();
+        assert!(written.curation.mode_explicit);
+        let (other, _) = parse_config("[curation]\nmin_release_age = \"3d\"\n").unwrap();
+        assert!(!other.curation.mode_explicit);
+        let (empty, _) = parse_config("").unwrap();
+        assert!(!empty.curation.mode_explicit);
+
+        let mut from_env = Config::default();
+        std::env::set_var("NORA_CURATION_MODE", "off");
+        let applied = from_env.curation.apply_env_overrides();
+        std::env::remove_var("NORA_CURATION_MODE");
+        applied.unwrap();
+        assert!(from_env.curation.mode_explicit);
+
+        // The defaults proxy public registries: off by default is announced as implicit.
+        match Config::default().curation_mode_notice() {
+            Some(CurationModeNotice::Implicit(proxies)) => {
+                assert!(proxies.contains(&RegistryType::Npm), "{proxies:?}");
+                assert!(proxies.contains(&RegistryType::Docker), "{proxies:?}");
+            }
+            other => panic!("default config: {other:?}"),
+        }
+        let mut off = Config::default();
+        off.curation.mode_explicit = true;
+        assert!(matches!(
+            off.curation_mode_notice(),
+            Some(CurationModeNotice::ExplicitOff(_))
+        ));
+        for mode in [CurationMode::Audit, CurationMode::Enforce] {
+            let mut on = Config::default();
+            on.curation.mode = mode;
+            assert_eq!(on.curation_mode_notice(), None);
+        }
+        // Nothing proxied: nothing is served unchecked, and nothing is said.
+        let mut hosted = Config::default();
+        hosted.apply_enabled_registries(&std::collections::HashSet::from([RegistryType::Raw]));
+        assert_eq!(hosted.curation_mode_notice(), None, "only raw mounted");
+    }
+
+    /// The empty setting switches the upstream off in both places it can be written, for all six
+    /// formats: the environment variable and the config file.
+    #[test]
+    fn an_empty_setting_reads_as_no_upstream_in_env_and_file() {
+        let _lock = env_lock();
+        for var in [
+            "NORA_GEMS_PROXY",
+            "NORA_NUGET_PROXY",
+            "NORA_CONAN_PROXY",
+            "NORA_TF_PROXY",
+            "NORA_ANSIBLE_PROXY",
+            "NORA_CPAN_PROXY",
+        ] {
+            std::env::set_var(var, "");
+        }
+        let mut cfg = Config::default();
+        cfg.apply_env_overrides().unwrap();
+        let mut spaced = Config::default();
+        for var in [
+            "NORA_GEMS_PROXY",
+            "NORA_NUGET_PROXY",
+            "NORA_CONAN_PROXY",
+            "NORA_TF_PROXY",
+            "NORA_ANSIBLE_PROXY",
+            "NORA_CPAN_PROXY",
+        ] {
+            std::env::set_var(var, "  ");
+        }
+        spaced.apply_env_overrides().unwrap();
+        for proxy in [
+            &spaced.gems.proxy,
+            &spaced.nuget.proxy,
+            &spaced.conan.proxy,
+            &spaced.terraform.proxy,
+            &spaced.ansible.proxy,
+            &spaced.cpan.proxy,
+        ] {
+            assert_eq!(proxy, &None, "a value of spaces in the environment");
+        }
+        for var in [
+            "NORA_GEMS_PROXY",
+            "NORA_NUGET_PROXY",
+            "NORA_CONAN_PROXY",
+            "NORA_TF_PROXY",
+            "NORA_ANSIBLE_PROXY",
+            "NORA_CPAN_PROXY",
+        ] {
+            std::env::remove_var(var);
+        }
+        let env = [
+            ("gems", cfg.gems.proxy.clone()),
+            ("nuget", cfg.nuget.proxy.clone()),
+            ("conan", cfg.conan.proxy.clone()),
+            ("terraform", cfg.terraform.proxy.clone()),
+            ("ansible", cfg.ansible.proxy.clone()),
+            ("cpan", cfg.cpan.proxy.clone()),
+        ];
+        for (format, proxy) in env {
+            assert_eq!(proxy, None, "{format}: empty environment variable");
+        }
+
+        let file: Config = toml::from_str(
+            "[gems]\nproxy = \"\"\n[nuget]\nproxy = \" \"\n[conan]\nproxy = \"\"\n[terraform]\nproxy = \"\"\n[ansible]\nproxy = \"\"\n[cpan]\nproxy = \"\"\n",
+        )
+        .unwrap();
+        for (format, proxy) in [
+            ("gems", file.gems.proxy),
+            ("nuget", file.nuget.proxy),
+            ("conan", file.conan.proxy),
+            ("terraform", file.terraform.proxy),
+            ("ansible", file.ansible.proxy),
+            ("cpan", file.cpan.proxy),
+        ] {
+            assert_eq!(proxy, None, "{format}: empty value in the config file");
+        }
+        // Control: a missing key keeps the public default.
+        let file: Config = toml::from_str("[gems]\nenabled = true\n").unwrap();
+        assert!(file.gems.proxy.is_some());
+    }
+
+    #[test]
+    fn test_rate_limit_default() {
+        let config = RateLimitConfig::default();
+        assert_eq!(config.auth_rps, 1);
+        assert_eq!(config.auth_burst, 5);
+        assert_eq!(config.upload_rps, 200);
+        assert_eq!(config.upload_burst, 500);
+        assert_eq!(config.general_rps, 100);
+        assert_eq!(config.general_burst, 200);
+    }
+
+    // NORA_RATE_LIMIT_*_RPS/_BURST reach the config unchanged, also far
+    // above 1000/s — a clamp at the source would undo the exact limiter downstream.
+    #[test]
+    fn rate_limit_env_overrides_are_kept_as_given() {
+        let _lock = env_lock();
+        let vars = [
+            ("NORA_RATE_LIMIT_AUTH_RPS", "1500"),
+            ("NORA_RATE_LIMIT_AUTH_BURST", "7"),
+            ("NORA_RATE_LIMIT_UPLOAD_RPS", "5000000"),
+            ("NORA_RATE_LIMIT_UPLOAD_BURST", "4000"),
+            ("NORA_RATE_LIMIT_GENERAL_RPS", "18446744073709551615"),
+            ("NORA_RATE_LIMIT_GENERAL_BURST", "900"),
+        ];
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        let mut config = RateLimitConfig::default();
+        config.apply_env_overrides();
+        for (k, _) in vars {
+            std::env::remove_var(k);
+        }
+        assert_eq!(config.auth_rps, 1500);
+        assert_eq!(config.auth_burst, 7);
+        assert_eq!(config.upload_rps, 5_000_000);
+        assert_eq!(config.upload_burst, 4000);
+        assert_eq!(config.general_rps, u64::MAX);
+        assert_eq!(config.general_burst, 900);
+    }
+
+    // The env overrides reach the *loaded* configuration unchanged: through load_from, which
+    // runs Config::apply_env_overrides and the checks after the rate limit section.
+    #[test]
+    fn rate_limit_env_reaches_the_loaded_config_unchanged() {
+        let _lock = env_lock();
+        let vars = [
+            ("NORA_RATE_LIMIT_AUTH_RPS", "1500"),
+            ("NORA_RATE_LIMIT_AUTH_BURST", "70000"),
+            ("NORA_RATE_LIMIT_UPLOAD_RPS", "5000000"),
+            ("NORA_RATE_LIMIT_UPLOAD_BURST", "4000"),
+            ("NORA_RATE_LIMIT_GENERAL_RPS", "18446744073709551615"),
+            ("NORA_RATE_LIMIT_GENERAL_BURST", "900"),
+        ];
+        for (k, v) in vars {
+            std::env::set_var(k, v);
+        }
+        let loaded = Config::load_from(None, NO_FALLBACK, false);
+        for (k, _) in vars {
+            std::env::remove_var(k);
+        }
+        let rl = loaded.unwrap().0.rate_limit;
+        assert_eq!(rl.auth_rps, 1500);
+        assert_eq!(rl.auth_burst, 70_000);
+        assert_eq!(rl.upload_rps, 5_000_000);
+        assert_eq!(rl.upload_burst, 4000);
+        assert_eq!(rl.general_rps, u64::MAX);
+        assert_eq!(rl.general_burst, 900);
+    }
+
+    #[test]
+    fn test_rate_limit_from_toml() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [rate_limit]
+            auth_rps = 10
+            upload_burst = 1000
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.rate_limit.auth_rps, 10);
+        assert_eq!(config.rate_limit.upload_burst, 1000);
+        assert_eq!(config.rate_limit.auth_burst, 5); // default
+    }
+
+    #[test]
+    fn test_basic_auth_header() {
+        let header = basic_auth_header("user:pass");
+        assert_eq!(header, "Basic dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn test_basic_auth_header_empty() {
+        let header = basic_auth_header("");
+        assert!(header.starts_with("Basic "));
+    }
+
+    /// require_integrity is read only by the allowlist filter: alone it holds nothing, so it
+    /// stops startup in every mode and is not counted as enforce's active control.
+    #[test]
+    fn require_integrity_without_an_allowlist_is_refused() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let allowlist = dir.path().join("allow.json");
+        std::fs::write(&allowlist, r#"{"version":1,"rules":[]}"#).unwrap();
+        for mode in [
+            CurationMode::Off,
+            CurationMode::Audit,
+            CurationMode::Enforce,
+        ] {
+            let mut c = Config::default();
+            c.curation.mode = mode.clone();
+            c.curation.require_integrity = true;
+            let (_, errors) = c.validate();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.starts_with("curation.require_integrity is set")),
+                "{mode:?}: {errors:?}"
+            );
+            if mode == CurationMode::Enforce {
+                assert!(
+                    errors.iter().any(|e| e.contains("no active control")),
+                    "require_integrity alone is no control: {errors:?}"
+                );
+            }
+            c.curation.allowlist_path = Some(allowlist.to_string_lossy().into_owned());
+            let (_, errors) = c.validate();
+            assert!(
+                !errors.iter().any(|e| e.contains("require_integrity")),
+                "{mode:?} with an allowlist: {errors:?}"
+            );
+        }
+    }
+
+    /// #579: a Hugging Face curation setting of its own holds nothing, so it stops startup
+    /// instead of being ignored — the env variables in validate, `[curation.hf]` at load.
+    #[test]
+    fn a_hugging_face_curation_setting_is_refused_not_ignored() {
+        let _lock = env_lock();
+        for var in hf_curation_env_vars() {
+            std::env::set_var(var, "3d");
+            let (_, errors) = Config::default().validate();
+            std::env::remove_var(var);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.starts_with(var) && e.contains("cannot apply")),
+                "{var}: {errors:?}"
+            );
+        }
+        assert!(
+            !Config::default()
+                .validate()
+                .1
+                .iter()
+                .any(|e| e.contains("NORA_CURATION_HF_")),
+            "nothing set, nothing refused"
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        for (name, body, refused) in [
+            (
+                "age.toml",
+                "[curation.hf]\nmin_release_age = \"3d\"\n",
+                true,
+            ),
+            (
+                "quarantine.toml",
+                "[curation.hf]\nquarantine = \"enforce\"\n",
+                true,
+            ),
+            (
+                "npm.toml",
+                "[curation.npm]\nmin_release_age = \"3d\"\n[curation]\nquarantine = \"observe\"\n",
+                false,
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            let loaded = Config::load_from(
+                Some(path.to_string_lossy().into_owned()),
+                NO_FALLBACK,
+                false,
+            );
+            match (&loaded, refused) {
+                (Err(ConfigLoadError::Invalid(errors)), true) => assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.contains("curation.hf cannot apply")),
+                    "{name}: {errors:?}"
+                ),
+                (Ok(_), false) => {}
+                _ => panic!(
+                    "{name}: refused={refused}, got {:?}",
+                    loaded.as_ref().map(|_| ())
+                ),
+            }
+        }
+    }
+
+    /// #1055: the npm `proxies` checks are part of `validate()`, private hosts feed the
+    /// upstream-leak detector, and a Bearer token is read from its env var at load.
+    #[test]
+    fn npm_proxies_are_validated_leak_checked_and_load_their_token() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nora.toml");
+        std::fs::write(
+            &path,
+            r#"
+[npm]
+proxies = [
+  "https://registry.npmjs.org",
+  { url = "https://npm.vendor.example", scopes = ["@vendor"], auth_bearer_env = "NORA_TEST_NPM_VENDOR_TOKEN" },
+]
+"#,
+        )
+        .unwrap();
+        let path = path.to_string_lossy().into_owned();
+
+        std::env::set_var("NORA_TEST_NPM_VENDOR_TOKEN", "tok-from-env");
+        let loaded = Config::load_from(Some(path.clone()), NO_FALLBACK, false).map(|(c, _)| c);
+        std::env::remove_var("NORA_TEST_NPM_VENDOR_TOKEN");
+        let config = loaded.expect("a set token loads");
+        let up = config.npm.route("@vendor/a").unwrap();
+        assert_eq!(
+            up.auth.unwrap().header_value().unwrap(),
+            "Bearer tok-from-env"
+        );
+        assert!(config
+            .upstream_hostnames()
+            .contains(&("npm".to_string(), "npm.vendor.example".to_string())));
+
+        // Unset token: the config is rejected at load, not served with silent 401s.
+        assert!(Config::load_from(Some(path), NO_FALLBACK, false).is_err());
+
+        let mut bad = Config::default();
+        bad.npm.proxies = vec![
+            NpmProxyEntry::Simple("https://registry.npmjs.org".into()),
+            NpmProxyEntry::Simple("https://mirror.example".into()),
+        ];
+        let (_, errors) = bad.validate_with_config_path(None);
+        assert!(
+            errors.iter().any(|e| e.contains("have no scopes")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn upstream_auth_header_carries_its_scheme_and_is_sensitive() {
+        let basic = UpstreamAuth::Basic("user:pass").header_value().unwrap();
+        assert_eq!(basic, "Basic dXNlcjpwYXNz");
+        assert!(basic.is_sensitive());
+        assert_eq!(format!("{basic:?}"), "Sensitive");
+
+        let bearer = UpstreamAuth::Bearer("npm_tok-1").header_value().unwrap();
+        assert_eq!(bearer, "Bearer npm_tok-1");
+        assert!(bearer.is_sensitive());
+        assert_eq!(format!("{bearer:?}"), "Sensitive");
+    }
+
+    #[test]
+    fn upstream_auth_bearer_with_newline_is_rejected_not_sent() {
+        assert!(UpstreamAuth::Bearer("tok\n").header_value().is_err());
+        assert!(UpstreamAuth::Bearer("tok\r\nX-Injected: 1")
+            .header_value()
+            .is_err());
+    }
+
+    #[test]
+    fn test_config_default() {
+        let config = Config::default();
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 4000);
+        assert_eq!(config.server.body_limit_mb, 2048);
+        assert!(config.server.public_url.is_none());
+        assert_eq!(config.storage.path, "data/storage");
+        assert_eq!(config.storage.mode, StorageMode::Local);
+        assert_eq!(config.storage.bucket, "registry");
+        assert_eq!(config.storage.s3_region, "us-east-1");
+        assert!(!config.auth.enabled);
+        assert_eq!(config.auth.htpasswd_file, "users.htpasswd");
+        assert_eq!(config.auth.token_storage, "data/tokens");
+        assert!(!config.cpan.enabled, "CPAN defaults to disabled");
+        assert!(!config.hf.enabled, "Hugging Face defaults to disabled");
+    }
+
+    #[test]
+    fn test_maven_config_default() {
+        let m = MavenConfig::default();
+        assert_eq!(m.proxy_timeout, 30);
+        assert_eq!(m.proxies.len(), 1);
+        assert_eq!(m.proxies[0].url(), "https://repo1.maven.org/maven2");
+        assert!(m.proxies[0].auth().is_none());
+    }
+
+    #[test]
+    fn test_npm_config_default() {
+        let n = NpmConfig::default();
+        assert_eq!(n.proxy, Some("https://registry.npmjs.org".to_string()));
+        assert!(n.proxy_auth.is_none());
+        assert_eq!(n.proxy_timeout, 30);
+        assert_eq!(n.metadata_ttl, 300);
+    }
+
+    #[test]
+    fn test_pypi_config_default() {
+        let p = PypiConfig::default();
+        assert_eq!(p.proxy, Some("https://pypi.org/simple/".to_string()));
+        assert!(p.proxy_auth.is_none());
+        assert_eq!(p.proxy_timeout, 30);
+    }
+
+    #[test]
+    fn test_docker_config_default() {
+        let d = DockerConfig::default();
+        assert_eq!(d.proxy_timeout, 300);
+        assert_eq!(d.upstreams.len(), 1);
+        assert_eq!(d.upstreams[0].url, "https://registry-1.docker.io");
+        assert!(d.upstreams[0].auth.is_none());
+    }
+
+    #[test]
+    fn test_raw_config_default() {
+        let r = RawConfig::default();
+        assert!(r.enabled);
+        assert_eq!(r.max_file_size, 104_857_600);
+    }
+
+    #[test]
+    fn test_auth_config_default() {
+        let a = AuthConfig::default();
+        assert!(!a.enabled);
+        assert!(!a.anonymous_read);
+        assert_eq!(a.htpasswd_file, "users.htpasswd");
+        assert_eq!(a.token_storage, "data/tokens");
+    }
+
+    #[test]
+    fn test_auth_anonymous_read_from_toml() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [auth]
+            enabled = true
+            anonymous_read = true
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.auth.enabled);
+        assert!(config.auth.anonymous_read);
+    }
+
+    #[test]
+    fn test_env_override_anonymous_read() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_AUTH_ANONYMOUS_READ", "true");
+        config.apply_env_overrides().unwrap();
+        assert!(config.auth.anonymous_read);
+        std::env::remove_var("NORA_AUTH_ANONYMOUS_READ");
+    }
+
+    #[test]
+    fn test_docker_anon_pull_defaults_false() {
+        // Fail-closed: absent from config => off, and independent of anonymous_read.
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [auth]
+            enabled = true
+            anonymous_read = true
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.auth.anonymous_read);
+        assert!(
+            !config.auth.docker_anon_pull,
+            "docker_anon_pull must NOT be implied by anonymous_read"
+        );
+    }
+
+    #[test]
+    fn test_docker_anon_pull_from_toml() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [auth]
+            enabled = true
+            docker_anon_pull = true
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.auth.docker_anon_pull);
+        assert!(!config.auth.anonymous_read);
+    }
+
+    #[test]
+    fn test_env_override_docker_anon_pull() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_AUTH_DOCKER_ANON_PULL", "true");
+        config.apply_env_overrides().unwrap();
+        assert!(config.auth.docker_anon_pull);
+        std::env::remove_var("NORA_AUTH_DOCKER_ANON_PULL");
+    }
+
+    #[test]
+    fn test_maven_proxy_entry_simple() {
+        let entry = MavenProxyEntry::Simple("https://repo.example.com".to_string());
+        assert_eq!(entry.url(), "https://repo.example.com");
+        assert!(entry.auth().is_none());
+    }
+
+    #[test]
+    fn test_maven_proxy_entry_full() {
+        let entry = MavenProxyEntry::Full(MavenProxy {
+            url: "https://private.repo.com".to_string(),
+            auth: Some(ProtectedString::from("user:secret")),
+        });
+        assert_eq!(entry.url(), "https://private.repo.com");
+        assert_eq!(entry.auth(), Some("user:secret"));
+    }
+
+    #[test]
+    fn test_maven_proxy_entry_full_no_auth() {
+        let entry = MavenProxyEntry::Full(MavenProxy {
+            url: "https://repo.com".to_string(),
+            auth: None,
+        });
+        assert_eq!(entry.url(), "https://repo.com");
+        assert!(entry.auth().is_none());
+    }
+
+    #[test]
+    fn test_storage_mode_default() {
+        let mode = StorageMode::default();
+        assert_eq!(mode, StorageMode::Local);
+    }
+
+    #[test]
+    fn test_env_override_server() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_HOST", "0.0.0.0");
+        std::env::set_var("NORA_PORT", "8080");
+        std::env::set_var("NORA_PUBLIC_URL", "registry.example.com");
+        std::env::set_var("NORA_BODY_LIMIT_MB", "4096");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 8080);
+        assert_eq!(
+            config.server.public_url,
+            Some("registry.example.com".to_string())
+        );
+        assert_eq!(config.server.body_limit_mb, 4096);
+        std::env::remove_var("NORA_HOST");
+        std::env::remove_var("NORA_PORT");
+        std::env::remove_var("NORA_PUBLIC_URL");
+        std::env::remove_var("NORA_BODY_LIMIT_MB");
+    }
+
+    #[test]
+    fn test_env_override_storage() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_STORAGE_MODE", "s3");
+        std::env::set_var("NORA_STORAGE_PATH", "/data/nora");
+        std::env::set_var("NORA_STORAGE_BUCKET", "my-bucket");
+        std::env::set_var("NORA_STORAGE_S3_REGION", "eu-west-1");
+        std::env::set_var("NORA_STORAGE_S3_VIRTUAL_HOSTED", "true");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.storage.mode, StorageMode::S3);
+        assert_eq!(config.storage.path, "/data/nora");
+        assert_eq!(config.storage.bucket, "my-bucket");
+        assert_eq!(config.storage.s3_region, "eu-west-1");
+        assert!(config.storage.s3_virtual_hosted);
+        std::env::remove_var("NORA_STORAGE_MODE");
+        std::env::remove_var("NORA_STORAGE_PATH");
+        std::env::remove_var("NORA_STORAGE_BUCKET");
+        std::env::remove_var("NORA_STORAGE_S3_REGION");
+        std::env::remove_var("NORA_STORAGE_S3_VIRTUAL_HOSTED");
+    }
+
+    #[test]
+    fn test_env_override_storage_virtual_hosted_default_off() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.apply_env_overrides().unwrap();
+        assert!(!config.storage.s3_virtual_hosted);
+        std::env::set_var("NORA_STORAGE_S3_VIRTUAL_HOSTED", "false");
+        config.apply_env_overrides().unwrap();
+        assert!(!config.storage.s3_virtual_hosted);
+        std::env::set_var("NORA_STORAGE_S3_VIRTUAL_HOSTED", "1");
+        config.apply_env_overrides().unwrap();
+        assert!(config.storage.s3_virtual_hosted);
+        std::env::remove_var("NORA_STORAGE_S3_VIRTUAL_HOSTED");
+    }
+
+    #[test]
+    fn test_env_override_storage_mode_local() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_STORAGE_MODE", "local");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.storage.mode, StorageMode::Local);
+        std::env::remove_var("NORA_STORAGE_MODE");
+    }
+
+    #[test]
+    fn test_env_override_storage_mode_case_insensitive() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_STORAGE_MODE", "S3");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.storage.mode, StorageMode::S3);
+        std::env::remove_var("NORA_STORAGE_MODE");
+    }
+
+    #[test]
+    fn test_env_override_storage_mode_rejects_unknown() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_STORAGE_MODE", "redis");
+        let result = config.apply_env_overrides();
+        assert!(result.is_err(), "unknown storage mode must be rejected");
+        assert!(result.unwrap_err().contains("NORA_STORAGE_MODE"));
+        std::env::remove_var("NORA_STORAGE_MODE");
+    }
+
+    #[test]
+    fn test_parse_env_warn_valid_u16() {
+        let mut port: u16 = 5000;
+        parse_env_warn("NORA_PORT", "8080", &mut port);
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn test_parse_env_warn_invalid_keeps_original() {
+        let mut port: u16 = 5000;
+        parse_env_warn("NORA_PORT", "not-a-number", &mut port);
+        assert_eq!(port, 5000, "invalid parse must keep original value");
+    }
+
+    #[test]
+    fn test_parse_env_warn_empty_keeps_original() {
+        let mut timeout: u64 = 30;
+        parse_env_warn("NORA_TIMEOUT", "", &mut timeout);
+        assert_eq!(timeout, 30, "empty string must keep original value");
+    }
+
+    #[test]
+    fn test_env_override_auth() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_AUTH_ENABLED", "true");
+        std::env::set_var("NORA_AUTH_HTPASSWD_FILE", "/etc/nora/users");
+        std::env::set_var("NORA_AUTH_TOKEN_STORAGE", "/data/tokens");
+        config.apply_env_overrides().unwrap();
+        assert!(config.auth.enabled);
+        assert_eq!(config.auth.htpasswd_file, "/etc/nora/users");
+        assert_eq!(config.auth.token_storage, "/data/tokens");
+        std::env::remove_var("NORA_AUTH_ENABLED");
+        std::env::remove_var("NORA_AUTH_HTPASSWD_FILE");
+        std::env::remove_var("NORA_AUTH_TOKEN_STORAGE");
+    }
+
+    #[test]
+    fn test_env_override_maven_proxies() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var(
+            "NORA_MAVEN_PROXIES",
+            "https://repo1.com,https://repo2.com|user:pass",
+        );
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.maven.proxies.len(), 2);
+        assert_eq!(config.maven.proxies[0].url(), "https://repo1.com");
+        assert!(config.maven.proxies[0].auth().is_none());
+        assert_eq!(config.maven.proxies[1].url(), "https://repo2.com");
+        assert_eq!(config.maven.proxies[1].auth(), Some("user:pass"));
+        std::env::remove_var("NORA_MAVEN_PROXIES");
+    }
+
+    #[test]
+    fn test_env_override_maven_checksum_and_immutable() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        assert!(config.maven.checksum_verify); // default true
+        assert!(config.maven.immutable_releases); // default true
+        std::env::set_var("NORA_MAVEN_CHECKSUM_VERIFY", "false");
+        std::env::set_var("NORA_MAVEN_IMMUTABLE_RELEASES", "false");
+        config.apply_env_overrides().unwrap();
+        assert!(!config.maven.checksum_verify);
+        assert!(!config.maven.immutable_releases);
+        std::env::remove_var("NORA_MAVEN_CHECKSUM_VERIFY");
+        std::env::remove_var("NORA_MAVEN_IMMUTABLE_RELEASES");
+    }
+
+    #[test]
+    fn test_s3_default_url() {
+        let config = Config::default();
+        assert_eq!(config.storage.s3_url, "http://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn test_env_override_npm() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_NPM_PROXY", "https://npm.company.com");
+        std::env::set_var("NORA_NPM_PROXY_AUTH", "user:token");
+        std::env::set_var("NORA_NPM_PROXY_TIMEOUT", "60");
+        std::env::set_var("NORA_NPM_METADATA_TTL", "600");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(
+            config.npm.proxy,
+            Some("https://npm.company.com".to_string())
+        );
+        assert_eq!(
+            crate::secrets::expose_opt(&config.npm.proxy_auth),
+            Some("user:token")
+        );
+        assert_eq!(config.npm.proxy_timeout, 60);
+        assert_eq!(config.npm.metadata_ttl, 600);
+        std::env::remove_var("NORA_NPM_PROXY");
+        std::env::remove_var("NORA_NPM_PROXY_AUTH");
+        std::env::remove_var("NORA_NPM_PROXY_TIMEOUT");
+        std::env::remove_var("NORA_NPM_METADATA_TTL");
+    }
+
+    #[test]
+    fn test_env_override_raw() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_RAW_ENABLED", "false");
+        std::env::set_var("NORA_RAW_MAX_FILE_SIZE", "524288000");
+        std::env::set_var("NORA_RAW_CACHE_CONTROL", "no-cache");
+        config.apply_env_overrides().unwrap();
+        assert!(!config.raw.enabled);
+        assert_eq!(config.raw.max_file_size, 524288000);
+        assert_eq!(config.raw.cache_control, "no-cache");
+        std::env::remove_var("NORA_RAW_ENABLED");
+        std::env::remove_var("NORA_RAW_MAX_FILE_SIZE");
+        std::env::remove_var("NORA_RAW_CACHE_CONTROL");
+    }
+
+    #[test]
+    fn test_env_override_rate_limit() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_RATE_LIMIT_ENABLED", "false");
+        std::env::set_var("NORA_RATE_LIMIT_AUTH_RPS", "10");
+        std::env::set_var("NORA_RATE_LIMIT_GENERAL_BURST", "500");
+        config.apply_env_overrides().unwrap();
+        assert!(!config.rate_limit.enabled);
+        assert_eq!(config.rate_limit.auth_rps, 10);
+        assert_eq!(config.rate_limit.general_burst, 500);
+        std::env::remove_var("NORA_RATE_LIMIT_ENABLED");
+        std::env::remove_var("NORA_RATE_LIMIT_AUTH_RPS");
+        std::env::remove_var("NORA_RATE_LIMIT_GENERAL_BURST");
+    }
+
+    #[test]
+    fn test_config_from_toml_full() {
+        let toml = r#"
+            [server]
+            host = "0.0.0.0"
+            port = 8080
+            public_url = "nora.example.com"
+            body_limit_mb = 4096
+
+            [storage]
+            mode = "s3"
+            path = "/data"
+            s3_url = "http://s3.example.com:9000"
+            bucket = "artifacts"
+            s3_region = "eu-central-1"
+
+            [auth]
+            enabled = true
+            htpasswd_file = "/etc/nora/users.htpasswd"
+
+            [raw]
+            enabled = false
+            max_file_size = 500000000
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 8080);
+        assert_eq!(
+            config.server.public_url,
+            Some("nora.example.com".to_string())
+        );
+        assert_eq!(config.server.body_limit_mb, 4096);
+        assert_eq!(config.storage.mode, StorageMode::S3);
+        assert_eq!(config.storage.s3_url, "http://s3.example.com:9000");
+        assert_eq!(config.storage.bucket, "artifacts");
+        assert!(config.auth.enabled);
+        assert!(!config.raw.enabled);
+        assert_eq!(config.raw.max_file_size, 500000000);
+    }
+
+    #[test]
+    fn test_config_from_toml_minimal() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        // Defaults should be filled
+        assert_eq!(config.storage.path, "data/storage");
+        assert_eq!(config.maven.proxies.len(), 1);
+        assert_eq!(
+            config.npm.proxy,
+            Some("https://registry.npmjs.org".to_string())
+        );
+        assert_eq!(config.docker.upstreams.len(), 1);
+        assert!(config.raw.enabled);
+        assert!(!config.auth.enabled);
+    }
+
+    #[test]
+    fn test_config_from_toml_partial() {
+        // Missing host and port in [server] — should use defaults
+        let toml = r#"
+            [server]
+            [storage]
+            mode = "local"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server.port, 4000);
+        assert_eq!(config.storage.path, "data/storage");
+
+        // Missing [server] entirely — should use defaults
+        let toml = r#"
+            [storage]
+            mode = "local"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server.port, 4000);
+
+        // Missing [storage] entirely — should use defaults
+        let toml = r#"
+            [server]
+            host = "0.0.0.0"
+            port = 8080
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 8080);
+        assert_eq!(config.storage.mode, StorageMode::Local);
+    }
+
+    /// Assert that a config section's field-level serde-default path equals its
+    /// `Default` impl — i.e. writing `[section]` with no keys behaves the same as
+    /// omitting the section entirely. A bare `#[serde(default)]` on an `Option`
+    /// field yields `None`, which silently diverges from a `Default` impl that
+    /// returns `Some(..)` (the npm/pypi proxy bug). Comparison via
+    /// `serde_json::Value` tolerates `ProtectedString` secrets (`skip_serializing`
+    /// → absent on both sides) and auto-covers future fields.
+    fn assert_serde_default_eq_default<T>(section: &str)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + Default,
+    {
+        let from_empty: T = toml::from_str("").unwrap_or_else(|e| {
+            panic!(
+                "[{section}] empty table must deserialize — every field needs a serde default: {e}"
+            )
+        });
+        assert_eq!(
+            serde_json::to_value(&from_empty).unwrap(),
+            serde_json::to_value(T::default()).unwrap(),
+            "[{section}]: serde field-defaults diverge from the Default impl — a present-but-empty \
+             [{section}] table behaves differently from omitting the section",
+        );
+    }
+
+    /// Invariant (whole class, not just the leaves that were caught): for EVERY
+    /// config section, the field-level `#[serde(default)]` path and the `Default`
+    /// impl must agree, so `[section]` with no keys == omitting `[section]`. The
+    /// only way to drift is a `serde(default = ...)`/`Default` mismatch — this
+    /// fails loudly if it ever happens. Previously this only covered
+    /// server/storage, which let the npm/pypi `proxy` divergence through.
+    #[test]
+    fn test_serde_defaults_match_default_impl() {
+        assert_serde_default_eq_default::<ServerConfig>("server");
+        assert_serde_default_eq_default::<StorageConfig>("storage");
+        // All 13 registries — this is where the proxy-default class lives.
+        assert_serde_default_eq_default::<MavenConfig>("maven");
+        assert_serde_default_eq_default::<NpmConfig>("npm");
+        assert_serde_default_eq_default::<PypiConfig>("pypi");
+        assert_serde_default_eq_default::<DockerConfig>("docker");
+        assert_serde_default_eq_default::<GoConfig>("go");
+        assert_serde_default_eq_default::<CargoConfig>("cargo");
+        assert_serde_default_eq_default::<RawConfig>("raw");
+        assert_serde_default_eq_default::<GemsConfig>("gems");
+        assert_serde_default_eq_default::<TerraformConfig>("terraform");
+        assert_serde_default_eq_default::<AnsibleConfig>("ansible");
+        assert_serde_default_eq_default::<NugetConfig>("nuget");
+        assert_serde_default_eq_default::<PubDartConfig>("pub_dart");
+        assert_serde_default_eq_default::<ConanConfig>("conan");
+        assert_serde_default_eq_default::<RpmConfig>("rpm");
+        assert_serde_default_eq_default::<DebConfig>("deb");
+        assert_serde_default_eq_default::<CpanConfig>("cpan");
+        assert_serde_default_eq_default::<HfConfig>("hf");
+        assert_serde_default_eq_default::<SigningConfig>("signing");
+
+        // Whole-Config fallback agrees with deserializing an empty file.
+        let from_empty_cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(from_empty_cfg.server, ServerConfig::default());
+    }
+
+    /// The config shipped in the container image (deploy/config.docker.toml,
+    /// loaded via NORA_CONFIG_PATH) must be valid for THIS struct and yield the
+    /// intended container defaults — so the image is zero-config out of the box
+    /// without baking config values as env (#719). A renamed/typo'd key would
+    /// otherwise fall back to a default silently, reintroducing the bug. Host is
+    /// deliberately absent (the container sets it via NORA_HOST).
+    #[test]
+    fn test_shipped_docker_config_is_valid() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../deploy/config.docker.toml");
+        let content =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+        let config: Config = toml::from_str(&content).unwrap();
+        assert_eq!(config.server.port, 4000);
+        assert_eq!(
+            config.server.public_url.as_deref(),
+            Some("http://localhost:4000")
+        );
+        assert_eq!(config.storage.mode, StorageMode::Local);
+        assert_eq!(config.storage.path, "/data/storage");
+        assert_eq!(config.auth.token_storage, "/data/tokens");
+    }
+
+    #[test]
+    fn test_config_toml_docker_upstreams() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [docker]
+            proxy_timeout = 120
+
+            [[docker.upstreams]]
+            url = "https://mirror.gcr.io"
+
+            [[docker.upstreams]]
+            url = "https://private.registry.io"
+            auth = "user:pass"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.docker.proxy_timeout, 120);
+        assert_eq!(config.docker.upstreams.len(), 2);
+        assert!(config.docker.upstreams[0].auth.is_none());
+        assert_eq!(
+            crate::secrets::expose_opt(&config.docker.upstreams[1].auth),
+            Some("user:pass")
+        );
+    }
+
+    /// `KEY=VALUE` lines of an env file (comments and blanks skipped).
+    fn env_file(text: &str) -> Vec<(String, String)> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect()
+    }
+
+    /// A default config with the server settings an env file sets (#1025).
+    fn with_env_file(text: &str) -> Config {
+        let mut config = Config::default();
+        for (key, value) in env_file(text) {
+            match key.as_str() {
+                "NORA_HOST" => config.server.host = value,
+                "NORA_PORT" => config.server.port = value.parse().unwrap(),
+                "NORA_PUBLIC_URL" => config.server.public_url = Some(value),
+                _ => {}
+            }
+        }
+        config
+    }
+
+    /// The defaults we ship must start: a fresh package install or `install.sh` run
+    /// used to crash-loop on its own nora.env (#1025).
+    #[test]
+    fn shipped_env_defaults_pass_validation() {
+        let _lock = env_lock();
+        let deb = include_str!("../../../dist/nora.env.example");
+        let script = include_str!("../../../dist/install.sh");
+        let heredoc = script
+            .split("cat > /tmp/nora.env << 'ENVEOF'")
+            .nth(1)
+            .and_then(|rest| rest.split("\nENVEOF").next())
+            .expect("install.sh writes a default nora.env");
+        for (name, text) in [("dist/nora.env.example", deb), ("dist/install.sh", heredoc)] {
+            let (_, errors) = with_env_file(text).validate();
+            assert!(
+                errors.is_empty(),
+                "{name} defaults fail validation: {errors:?}"
+            );
+        }
+    }
+
+    /// Both unit files stop instead of restarting on a configuration error.
+    #[test]
+    fn units_do_not_restart_on_a_config_error() {
+        let unit = include_str!("../../../dist/nora.service");
+        let script = include_str!("../../../dist/install.sh");
+        let wanted = format!("RestartPreventExitStatus={EXIT_CONFIG}");
+        assert!(unit.contains(&wanted), "dist/nora.service lacks {wanted}");
+        assert!(script.contains(&wanted), "install.sh's unit lacks {wanted}");
+    }
+
+    /// Every fatal case of loading comes back as its own typed error, never a panic:
+    /// an unreadable config file, invalid TOML, and a configuration validation rejects.
+    #[test]
+    fn load_reports_each_fatal_case_as_a_typed_error() {
+        // load() applies NORA_* overrides; other tests set invalid ones under this lock.
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+
+        let missing = Config::load_from(Some(path("absent.toml")), NO_FALLBACK, false)
+            .expect_err("missing file");
+        assert!(
+            matches!(missing, ConfigLoadError::Unreadable { .. }),
+            "{missing}"
+        );
+
+        std::fs::write(path("broken.toml"), "[server\nport = ").unwrap();
+        let broken = Config::load_from(Some(path("broken.toml")), NO_FALLBACK, false)
+            .expect_err("invalid TOML");
+        assert!(
+            matches!(broken, ConfigLoadError::InvalidToml { .. }),
+            "{broken}"
+        );
+
+        // An error no test's temporary NORA_* variables can mask.
+        std::fs::write(path("empty-path.toml"), "[storage]\npath = \"\"\n").unwrap();
+        let invalid = Config::load_from(Some(path("empty-path.toml")), NO_FALLBACK, false)
+            .expect_err("validation");
+        assert!(matches!(invalid, ConfigLoadError::Invalid(_)), "{invalid}");
+        assert!(invalid.to_string().contains("storage.path"), "{invalid}");
+    }
+
+    /// Paths of the unknown keys of `content`, sorted; panics if it does not parse.
+    fn unknown_keys(content: &str) -> Vec<String> {
+        let (_, mut keys) = parse_config(content).unwrap_or_else(|e| panic!("{e}\n{content}"));
+        keys.sort();
+        keys
+    }
+
+    /// A typo is reported with the full path to it, at every depth: top level, a section,
+    /// an array of tables, a whole unknown section (reported once, not key by key).
+    #[test]
+    fn unknown_keys_are_listed_with_their_full_path() {
+        let content = r#"
+            typo_top = 1
+
+            [curation]
+            mdoe = "enforce"
+
+            [[docker.upstreams]]
+            url = "https://registry-1.docker.io"
+            auht = "user:pass"
+
+            [unknwon_section]
+            a = 1
+            b = 2
+        "#;
+        assert_eq!(
+            unknown_keys(content),
+            [
+                "curation.mdoe",
+                "docker.upstreams.0.auht",
+                "typo_top",
+                "unknwon_section"
+            ]
+        );
+        // the hazard the list exists for: the typo leaves curation at its default
+        let (config, _) = parse_config(content).unwrap();
+        assert_eq!(config.curation.mode, CurationMode::default());
+    }
+
+    /// A typo in any table of the config is listed — derived from the serialized default
+    /// config, so a new section or nested table is covered without editing this test.
+    /// Tables whose keys are names (maps) cannot hold an unknown key; they are pinned
+    /// below, so a struct table cannot hide among them.
+    #[test]
+    fn a_typo_in_any_table_is_listed() {
+        fn strip_nulls(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    m.retain(|_, x| !x.is_null());
+                    m.values_mut().for_each(strip_nulls);
+                }
+                serde_json::Value::Array(a) => a.iter_mut().for_each(strip_nulls),
+                _ => {}
+            }
+        }
+        fn tables(v: &serde_json::Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    out.push(path.clone());
+                    for (k, x) in m {
+                        path.push(k.clone());
+                        tables(x, path, out);
+                        path.pop();
+                    }
+                }
+                serde_json::Value::Array(a) => {
+                    for (i, x) in a.iter().enumerate() {
+                        path.push(i.to_string());
+                        tables(x, path, out);
+                        path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn insert_typo(v: &mut serde_json::Value, path: &[String]) {
+            let target = path.iter().fold(v, |v, seg| match v {
+                serde_json::Value::Array(a) => &mut a[seg.parse::<usize>().unwrap()],
+                other => &mut other[seg.as_str()],
+            });
+            target["zz_typo"] = serde_json::json!(1);
+        }
+
+        let mut default = serde_json::to_value(Config::default()).unwrap();
+        strip_nulls(&mut default);
+        let mut all = Vec::new();
+        tables(&default, &mut Vec::new(), &mut all);
+        assert!(all.len() > 25, "the walk stopped seeing tables: {all:?}");
+
+        let mut maps = Vec::new();
+        for table in &all {
+            let mut doc = default.clone();
+            insert_typo(&mut doc, table);
+            let content = toml::to_string(&doc).unwrap();
+            let dotted = table.join(".");
+            match parse_config(&content) {
+                Ok((_, keys)) => {
+                    let want = if dotted.is_empty() {
+                        "zz_typo".to_string()
+                    } else {
+                        format!("{dotted}.zz_typo")
+                    };
+                    assert_eq!(keys, [want], "typo in [{dotted}]");
+                }
+                Err(_) => maps.push(dotted),
+            }
+        }
+        assert_eq!(
+            maps,
+            ["circuit_breaker.overrides", "deb.proxies", "rpm.proxies"],
+            "only name-keyed maps may refuse a typo key; a struct here hides its typos"
+        );
+    }
+
+    /// Every key the config reads is not listed: an empty file, the full default config,
+    /// and every secret — secrets are `skip_serializing`, so the round trip cannot see them.
+    #[test]
+    fn known_keys_are_not_listed() {
+        assert!(unknown_keys("").is_empty());
+        let default = toml::to_string(&{
+            let mut v = serde_json::to_value(Config::default()).unwrap();
+            fn strip(v: &mut serde_json::Value) {
+                if let serde_json::Value::Object(m) = v {
+                    m.retain(|_, x| !x.is_null());
+                    m.values_mut().for_each(strip);
+                } else if let serde_json::Value::Array(a) = v {
+                    a.iter_mut().for_each(strip);
+                }
+            }
+            strip(&mut v);
+            v
+        })
+        .unwrap();
+        assert!(unknown_keys(&default).is_empty(), "{default}");
+
+        // one `# secret` line per `skip_serializing` field of the config structs
+        const SECRETS: &str = r#"
+            [storage]
+            s3_access_key = "ak"  # secret
+            s3_secret_key = "sk"  # secret
+            [curation]
+            bypass_token = "t"  # secret
+            [npm]
+            proxy_auth = "u:p"  # secret
+            proxies = [{ url = "https://npm.example", scopes = ["@x"], auth = "u:p" }]  # secret
+            [pypi]
+            proxy_auth = "u:p"  # secret
+            proxies = [{ url = "https://pypi.example", auth = "u:p" }]  # secret
+            [maven]
+            proxies = [{ url = "https://maven.example", auth = "u:p" }]  # secret
+            [[docker.upstreams]]
+            url = "https://docker.example"
+            auth = "u:p"  # secret
+            [go]
+            proxy_auth = "u:p"  # secret
+            [cargo]
+            proxy_auth = "u:p"  # secret
+            [gems]
+            proxy_auth = "u:p"  # secret
+            [terraform]
+            proxy_auth = "u:p"  # secret
+            [ansible]
+            proxy_auth = "u:p"  # secret
+            [nuget]
+            proxy_auth = "u:p"  # secret
+            [pub_dart]
+            proxy_auth = "u:p"  # secret
+            [conan]
+            proxy_auth = "u:p"  # secret
+            [cpan]
+            proxy_auth = "u:p"  # secret
+            [rpm.proxies]
+            fedora = { url = "https://rpm.example", auth = "u:p" }  # secret
+        "#;
+        assert!(unknown_keys(SECRETS).is_empty());
+
+        let mut in_source = 0;
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/config");
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let src = std::fs::read_to_string(&p).unwrap();
+                    in_source += src
+                        .lines()
+                        .filter(|l| l.trim_start().starts_with("#[serde("))
+                        .filter(|l| {
+                            l.contains("skip_serializing)") || l.contains("skip_serializing,")
+                        })
+                        .count();
+                }
+            }
+        }
+        assert_eq!(
+            SECRETS.matches("# secret").count(),
+            in_source,
+            "a secret field was added or removed: list it in SECRETS"
+        );
+    }
+
+    /// A typo inside a proxy entry given as a table is listed with its full path, like any
+    /// other typo — the entry is a URL string or a table, and the table's keys are tracked.
+    #[test]
+    fn typo_inside_a_proxy_entry_is_listed() {
+        let content = r#"
+            [maven]
+            proxies = ["https://m1.example", { url = "https://m2.example", auht = "u:p" }]
+            [pypi]
+            proxies = [{ url = "https://p.example", auht = "u:p" }]
+            [rpm.proxies]
+            fedora = { url = "https://r.example", auht = "u:p" }
+            [deb.proxies]
+            debian = { url = "https://d.example", atuh = "u:p" }
+        "#;
+        assert_eq!(
+            unknown_keys(content),
+            [
+                "deb.proxies.debian.atuh",
+                "maven.proxies.1.auht",
+                "pypi.proxies.0.auht",
+                "rpm.proxies.fedora.auht",
+            ]
+        );
+    }
+
+    /// Proxy entries written before keep loading the same: a URL string, a table with
+    /// `url` and `auth`, both mixed in one list; and what was refused stays refused.
+    #[test]
+    fn proxy_entries_load_as_before() {
+        let (config, keys) = parse_config(
+            r#"
+            [maven]
+            proxies = ["https://m1.example", { url = "https://m2.example", auth = "u:p" }]
+            [pypi]
+            proxies = ["https://p1.example", { url = "https://p2.example", auth = "u:p" }]
+            [rpm.proxies]
+            fedora = "https://r1.example"
+            epel = { url = "https://r2.example", auth = "u:p" }
+            [deb.proxies]
+            debian = "https://d1.example"
+            local = { url = "https://d2.example" }
+            "#,
+        )
+        .unwrap();
+        assert!(keys.is_empty(), "{keys:?}");
+        let maven: Vec<_> = config
+            .maven
+            .proxies
+            .iter()
+            .map(|p| (p.url(), p.auth()))
+            .collect();
+        assert_eq!(
+            maven,
+            [
+                ("https://m1.example", None),
+                ("https://m2.example", Some("u:p"))
+            ]
+        );
+        assert!(matches!(
+            config.maven.proxies[0],
+            MavenProxyEntry::Simple(_)
+        ));
+        assert!(matches!(config.maven.proxies[1], MavenProxyEntry::Full(_)));
+        let pypi: Vec<_> = config
+            .pypi
+            .proxies
+            .iter()
+            .map(|p| (p.url(), p.auth()))
+            .collect();
+        assert_eq!(
+            pypi,
+            [
+                ("https://p1.example", None),
+                ("https://p2.example", Some("u:p"))
+            ]
+        );
+        assert_eq!(config.rpm.proxies["fedora"].url(), "https://r1.example");
+        assert_eq!(config.rpm.proxies["fedora"].auth(), None);
+        assert_eq!(config.rpm.proxies["epel"].url(), "https://r2.example");
+        assert_eq!(config.rpm.proxies["epel"].auth(), Some("u:p"));
+        assert_eq!(config.deb.proxies["debian"].url(), "https://d1.example");
+        assert_eq!(config.deb.proxies["local"].url(), "https://d2.example");
+        assert_eq!(config.deb.proxies["local"].auth(), None);
+
+        for refused in [
+            "[maven]\nproxies = [1]\n",
+            "[maven]\nproxies = [{ auth = \"u:p\" }]\n",
+            "[pypi]\nproxies = [true]\n",
+            "[rpm.proxies]\nfedora = 1\n",
+            "[deb.proxies]\ndebian = { auth = \"u:p\" }\n",
+        ] {
+            assert!(
+                parse_config(refused).is_err(),
+                "must stay refused: {refused}"
+            );
+        }
+    }
+
+    /// Serialization is unchanged: a string entry stays a string, a table keeps its `url`
+    /// and never writes the secret.
+    #[test]
+    fn proxy_entries_serialize_as_before() {
+        let (config, _) = parse_config(
+            "[maven]\nproxies = [\"https://m1.example\", { url = \"https://m2.example\", auth = \"u:p\" }]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&config.maven.proxies).unwrap(),
+            serde_json::json!(["https://m1.example", { "url": "https://m2.example" }])
+        );
+    }
+
+    /// Strict mode refuses a typo inside a proxy entry like any other.
+    #[test]
+    fn strict_mode_refuses_a_typo_inside_a_proxy_entry() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let typo = dir.path().join("typo.toml").to_string_lossy().into_owned();
+        std::fs::write(
+            &typo,
+            "[maven]\nproxies = [{ url = \"https://m.example\", auht = \"u:p\" }]\n",
+        )
+        .unwrap();
+        match Config::load_from(Some(typo), NO_FALLBACK, true) {
+            Err(ConfigLoadError::UnknownKeys { keys, .. }) => {
+                assert_eq!(keys, ["maven.proxies.0.auht"])
+            }
+            other => panic!("strict mode must refuse the typo, got {other:?}"),
+        }
+    }
+
+    /// The config shipped in the image has no unknown keys: strict mode must start on it.
+    #[test]
+    fn shipped_docker_config_has_no_unknown_keys() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../deploy/config.docker.toml");
+        assert!(unknown_keys(&std::fs::read_to_string(path).unwrap()).is_empty());
+    }
+
+    /// Without strict mode the server starts and the keys come back for the warning;
+    /// with it, loading fails with a typed error that names every key.
+    #[test]
+    fn strict_mode_refuses_unknown_keys_and_default_mode_lists_them() {
+        // load_from applies NORA_* overrides; other tests set invalid ones under this lock.
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let typo = dir.path().join("typo.toml").to_string_lossy().into_owned();
+        std::fs::write(
+            &typo,
+            "[curation]\nmdoe = \"enforce\"\n[gc]\nenabeld = true\n",
+        )
+        .unwrap();
+
+        let (_, keys) =
+            Config::load_from(Some(typo.clone()), NO_FALLBACK, false).expect("default mode starts");
+        assert_eq!(keys, ["curation.mdoe", "gc.enabeld"]);
+
+        match Config::load_from(Some(typo.clone()), NO_FALLBACK, true) {
+            Err(ConfigLoadError::UnknownKeys { path, keys }) => {
+                assert_eq!(path, typo);
+                assert_eq!(keys, ["curation.mdoe", "gc.enabeld"]);
+            }
+            other => panic!("strict mode must refuse unknown keys, got {other:?}"),
+        }
+
+        let valid = dir.path().join("valid.toml").to_string_lossy().into_owned();
+        std::fs::write(&valid, "[curation]\nmode = \"off\"\n").unwrap();
+        let (_, keys) =
+            Config::load_from(Some(valid), NO_FALLBACK, true).expect("strict starts on valid");
+        assert!(keys.is_empty());
+    }
+
+    /// A fallback path no test creates, for tests that pass `NORA_CONFIG_PATH`.
+    const NO_FALLBACK: &str = "/nonexistent/nora-test/config.toml";
+
+    /// The working-directory `config.toml` (no `NORA_CONFIG_PATH`) is held to the same
+    /// rule at start. (On reload both sources share one code path; see the reload test.)
+    #[test]
+    fn fallback_config_file_is_held_to_the_same_rule() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let typo = dir
+            .path()
+            .join("config.toml")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&typo, "[curation]\nmdoe = \"enforce\"\n").unwrap();
+
+        let (_, keys) = Config::load_from(None, &typo, false).expect("default mode starts");
+        assert_eq!(keys, ["curation.mdoe"]);
+        assert!(matches!(
+            Config::load_from(None, &typo, true),
+            Err(ConfigLoadError::UnknownKeys { .. })
+        ));
+    }
+
+    /// `NORA_CONFIG_STRICT` follows the other boolean switches: `true` (any case) or `1`.
+    #[test]
+    fn config_strict_reads_its_env_switch() {
+        let _lock = env_lock();
+        let read = |v: Option<&str>| {
+            match v {
+                Some(v) => std::env::set_var("NORA_CONFIG_STRICT", v),
+                None => std::env::remove_var("NORA_CONFIG_STRICT"),
+            }
+            let on = config_strict_from_env();
+            std::env::remove_var("NORA_CONFIG_STRICT");
+            on
+        };
+        assert!(!read(None));
+        assert!(read(Some("true")));
+        assert!(read(Some("TRUE")));
+        assert!(read(Some("1")));
+        assert!(!read(Some("false")));
+        assert!(!read(Some("0")));
+    }
+
+    /// `Config::load` itself reads `NORA_CONFIG_STRICT`: the switch reaches the start path,
+    /// not only the helper the other tests drive.
+    #[test]
+    fn load_reads_the_strict_switch_from_env() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let typo = dir.path().join("typo.toml").to_string_lossy().into_owned();
+        std::fs::write(&typo, "[curation]\nmdoe = \"enforce\"\n").unwrap();
+        std::env::set_var("NORA_CONFIG_PATH", &typo);
+        std::env::set_var("NORA_CONFIG_STRICT", "true");
+        let strict = Config::load();
+        std::env::remove_var("NORA_CONFIG_STRICT");
+        let lenient = Config::load();
+        std::env::remove_var("NORA_CONFIG_PATH");
+        assert!(
+            matches!(&strict, Err(ConfigLoadError::UnknownKeys { keys, .. }) if keys == &["curation.mdoe"]),
+            "{strict:?}"
+        );
+        assert!(lenient.is_ok(), "{:?}", lenient.err());
+    }
+
+    /// SIGHUP reload honours strict mode too: a reload with a typo is refused, so the
+    /// running configuration stays.
+    #[test]
+    fn reload_refuses_unknown_keys_in_strict_mode() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let typo = dir.path().join("typo.toml").to_string_lossy().into_owned();
+        std::fs::write(&typo, "[curation]\nmdoe = \"enforce\"\n").unwrap();
+        std::env::set_var("NORA_CONFIG_PATH", &typo);
+        std::env::set_var("NORA_CONFIG_STRICT", "true");
+        let strict = Config::try_load();
+        std::env::remove_var("NORA_CONFIG_STRICT");
+        let lenient = Config::try_load();
+        std::env::remove_var("NORA_CONFIG_PATH");
+        let err = strict.expect_err("strict reload must refuse unknown keys");
+        assert!(err.contains("curation.mdoe"), "{err}");
+        assert!(lenient.is_ok(), "{:?}", lenient.err());
+    }
+
+    /// A fatal configuration error is a typed error for `main` to exit on with
+    /// EX_CONFIG, not a panic (which aborted with SIGABRT and made systemd retry).
+    #[test]
+    fn fatal_validation_is_an_error_not_a_panic() {
+        assert_eq!(EXIT_CONFIG, 78, "EX_CONFIG from sysexits.h");
+        let mut config = Config::default();
+        config.server.host = "0.0.0.0".to_string();
+        config.server.public_url = None;
+        let err = config
+            .checked()
+            .expect_err("wildcard host without public_url");
+        assert!(matches!(err, ConfigLoadError::Invalid(_)));
+        assert!(err.to_string().contains("NORA_PUBLIC_URL"), "{err}");
+
+        let mut ok = Config::default();
+        ok.server.host = "::".to_string();
+        ok.server.public_url = Some("http://localhost:4000".to_string());
+        assert!(ok.checked().is_ok());
+    }
+
+    #[test]
+    fn test_validate_default_config_ok() {
+        let _lock = env_lock();
+        let config = Config::default();
+        let (warnings, errors) = config.validate();
+        assert!(
+            errors.is_empty(),
+            "default config should have no errors: {:?}",
+            errors
+        );
+        assert!(
+            warnings.is_empty(),
+            "default config should have no warnings: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_is_loopback_host() {
+        // loopback forms (caller strips IPv6 brackets before calling)
+        assert!(Config::is_loopback_host("127.0.0.1"));
+        assert!(Config::is_loopback_host("127.1.2.3")); // whole 127.0.0.0/8
+        assert!(Config::is_loopback_host("::1"));
+        assert!(Config::is_loopback_host("localhost"));
+        assert!(Config::is_loopback_host("LocalHost")); // case-insensitive (#590 review)
+                                                        // not loopback
+        assert!(!Config::is_loopback_host("0.0.0.0")); // wildcard → handled as error elsewhere
+        assert!(!Config::is_loopback_host("192.168.1.10"));
+        assert!(!Config::is_loopback_host("8.8.8.8"));
+        assert!(!Config::is_loopback_host("registry.example.com"));
+    }
+
+    #[test]
+    fn test_validate_public_url_loopback_warns() {
+        let _lock = env_lock();
+        // public_url explicitly pointing at loopback is broken for remote clients (#590):
+        // a warning, not an error, since local-only use is valid. Tested through
+        // validate() (not is_loopback_host directly) to cover the real host_str() path,
+        // including IPv6 literals whose brackets must be stripped (#590 review).
+        for url in [
+            "http://localhost:4000",
+            "http://127.0.0.1:4000",
+            "http://[::1]:4000",
+        ] {
+            let mut config = Config::default();
+            config.server.public_url = Some(url.to_string());
+            let (warnings, errors) = config.validate_with_config_path(None);
+            assert!(
+                errors.is_empty(),
+                "loopback public_url '{url}' is a warning, not an error: {:?}",
+                errors
+            );
+            assert!(
+                warnings.iter().any(|w| w.contains("loopback")),
+                "expected loopback warning for public_url '{url}': {:?}",
+                warnings
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_port_zero() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.server.port = 0;
+        let (_, errors) = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("port"));
+    }
+
+    #[test]
+    fn test_validate_empty_storage_path_local() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.storage.mode = StorageMode::Local;
+        config.storage.path = String::new();
+        let (_, errors) = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("storage.path"));
+    }
+
+    #[test]
+    fn test_validate_whitespace_storage_path_local() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.storage.mode = StorageMode::Local;
+        config.storage.path = "   ".to_string();
+        let (_, errors) = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("storage.path"));
+    }
+
+    #[test]
+    fn test_validate_empty_bucket_s3() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.storage.mode = StorageMode::S3;
+        config.storage.bucket = String::new();
+        let (_, errors) = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("storage.bucket"));
+    }
+
+    #[test]
+    fn test_validate_empty_storage_path_s3_ok() {
+        let _lock = env_lock();
+        // Empty path is fine when mode is S3
+        let mut config = Config::default();
+        config.storage.mode = StorageMode::S3;
+        config.storage.path = String::new();
+        let (_, errors) = config.validate();
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_validate_rate_limit_zero_rps() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.rate_limit.enabled = true;
+        config.rate_limit.auth_rps = 0;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("auth_rps"));
+    }
+
+    #[test]
+    fn test_validate_rate_limit_disabled_zero_ok() {
+        let _lock = env_lock();
+        // Zero rate limit values are fine when rate limiting is disabled
+        let mut config = Config::default();
+        config.rate_limit.enabled = false;
+        config.rate_limit.auth_rps = 0;
+        config.rate_limit.auth_burst = 0;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_rate_limit_all_zeros() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.rate_limit.enabled = true;
+        config.rate_limit.auth_rps = 0;
+        config.rate_limit.auth_burst = 0;
+        config.rate_limit.upload_rps = 0;
+        config.rate_limit.upload_burst = 0;
+        config.rate_limit.general_rps = 0;
+        config.rate_limit.general_burst = 0;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert_eq!(warnings.len(), 6);
+    }
+
+    #[test]
+    fn test_validate_body_limit_zero() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.server.body_limit_mb = 0;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("body_limit_mb"));
+    }
+
+    #[test]
+    fn test_validate_multiple_errors() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.server.port = 0;
+        config.storage.mode = StorageMode::Local;
+        config.storage.path = String::new();
+        let (_, errors) = config.validate();
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn test_validate_warnings_and_errors_together() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.server.port = 0;
+        config.server.body_limit_mb = 0;
+        config.rate_limit.enabled = true;
+        config.rate_limit.auth_rps = 0;
+        let (warnings, errors) = config.validate();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(warnings.len(), 2); // body_limit + auth_rps
+    }
+    #[test]
+    fn test_validate_gc_enabled_dry_run() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.gc.enabled = true;
+        config.gc.dry_run = true;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("gc.dry_run"));
+    }
+
+    #[test]
+    fn test_validate_gc_enabled_no_dry_run_ok() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.gc.enabled = true;
+        config.gc.dry_run = false;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_retention_enabled_empty_rules() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.retention.enabled = true;
+        config.retention.rules = Vec::new();
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("retention"));
+    }
+
+    #[test]
+    fn test_validate_retention_enabled_with_rules_ok() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.retention.enabled = true;
+        config.retention.rules = vec![RetentionRule {
+            registry: "docker".to_string(),
+            name_glob: None,
+            keep_last: Some(5),
+            older_than_days: None,
+            include_tags: Vec::new(),
+            exclude_tags: Vec::new(),
+        }];
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_relative_paths_with_config_path() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.auth.enabled = true;
+        // default paths are relative: "data/storage", "data/tokens"
+        let (warnings, _) =
+            config.validate_with_config_path(Some("/tmp/test-config.toml".to_string()));
+        assert!(
+            warnings.iter().any(|w| w.contains("storage.path")),
+            "should warn about relative storage.path"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("token_storage")),
+            "should warn about relative token_storage"
+        );
+    }
+
+    #[test]
+    fn test_relative_token_storage_warns_without_config_path() {
+        let _lock = env_lock();
+        // #816: env-only (systemd) starts have config_path=None. A relative
+        // token_storage with auth enabled must still warn — that is exactly the
+        // case that escapes the sandbox and breaks token writes.
+        let mut config = Config::default();
+        config.auth.enabled = true; // default token_storage = "data/tokens" (relative)
+        let (warnings, _) = config.validate_with_config_path(None);
+        assert!(
+            warnings.iter().any(|w| w.contains("token_storage")),
+            "relative token_storage must warn even with no config file (env-only deploy)"
+        );
+        // The storage.path hint stays scoped to explicit-config starts (no noise on
+        // the bare-serve relative default).
+        assert!(
+            !warnings.iter().any(|w| w.contains("storage.path")),
+            "storage.path hint should remain gated behind an explicit config file"
+        );
+    }
+
+    #[test]
+    fn test_validate_absolute_paths_no_warning() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.storage.path = "/data/storage".to_string();
+        config.auth.enabled = true;
+        config.auth.token_storage = "/data/tokens".to_string();
+        let (warnings, _) =
+            config.validate_with_config_path(Some("/tmp/test-config.toml".to_string()));
+        assert!(
+            !warnings.iter().any(|w| w.contains("storage.path")),
+            "should not warn about absolute storage.path"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("token_storage")),
+            "should not warn about absolute token_storage"
+        );
+    }
+
+    #[test]
+    fn test_env_override_docker_proxies_and_backward_compat() {
+        let _lock = env_lock();
+        // Test new NORA_DOCKER_PROXIES name
+        std::env::remove_var("NORA_DOCKER_UPSTREAMS");
+        std::env::set_var(
+            "NORA_DOCKER_PROXIES",
+            "https://mirror.gcr.io,https://private.io|token123",
+        );
+        let mut config = Config::default();
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.docker.upstreams.len(), 2);
+        assert_eq!(config.docker.upstreams[0].url, "https://mirror.gcr.io");
+        assert!(config.docker.upstreams[0].auth.is_none());
+        assert_eq!(config.docker.upstreams[1].url, "https://private.io");
+        assert_eq!(
+            crate::secrets::expose_opt(&config.docker.upstreams[1].auth),
+            Some("token123")
+        );
+        std::env::remove_var("NORA_DOCKER_PROXIES");
+
+        // Test backward compat: old NORA_DOCKER_UPSTREAMS still works
+        std::env::remove_var("NORA_DOCKER_PROXIES");
+        std::env::set_var("NORA_DOCKER_UPSTREAMS", "https://legacy.io|secret");
+        let mut config2 = Config::default();
+        config2.apply_env_overrides().unwrap();
+        assert_eq!(config2.docker.upstreams.len(), 1);
+        assert_eq!(config2.docker.upstreams[0].url, "https://legacy.io");
+        assert_eq!(
+            crate::secrets::expose_opt(&config2.docker.upstreams[0].auth),
+            Some("secret")
+        );
+        std::env::remove_var("NORA_DOCKER_UPSTREAMS");
+    }
+
+    #[test]
+    fn test_env_override_go_proxy() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_GO_PROXY", "https://goproxy.company.com");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(
+            config.go.proxy,
+            Some("https://goproxy.company.com".to_string()),
+        );
+        std::env::remove_var("NORA_GO_PROXY");
+    }
+
+    #[test]
+    fn test_env_override_go_proxy_auth() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_GO_PROXY_AUTH", "user:pass");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(
+            crate::secrets::expose_opt(&config.go.proxy_auth),
+            Some("user:pass")
+        );
+        std::env::remove_var("NORA_GO_PROXY_AUTH");
+    }
+
+    #[test]
+    fn test_cargo_config_default() {
+        let c = CargoConfig::default();
+        assert_eq!(c.proxy, Some("https://crates.io".to_string()));
+        assert_eq!(c.proxy_timeout, 30);
+    }
+
+    #[test]
+    fn test_config_file_sets_s3_mode_without_env() {
+        let _lock = env_lock();
+        // Regression test for issue #4: config.toml mode="s3" must work
+        // without NORA_STORAGE_MODE env var (previously overridden by
+        // Dockerfile ENV NORA_STORAGE_MODE=local)
+        std::env::remove_var("NORA_STORAGE_MODE");
+
+        let toml = r#"
+            [server]
+            host = "0.0.0.0"
+            port = 4000
+
+            [storage]
+            mode = "s3"
+            s3_url = "http://s3.example.com:9000"
+            bucket = "nora"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).unwrap();
+        config.apply_env_overrides().unwrap();
+        assert_eq!(
+            config.storage.mode,
+            StorageMode::S3,
+            "config.toml mode=s3 must not be overridden when NORA_STORAGE_MODE is unset"
+        );
+    }
+
+    // ========================================================================
+    // Curation config tests
+    // ========================================================================
+
+    #[test]
+    fn test_curation_config_default() {
+        let c = CurationConfig::default();
+        assert_eq!(c.mode, CurationMode::Off);
+        assert_eq!(c.on_failure, CurationOnFailure::Closed);
+        assert!(c.allowlist_path.is_none());
+        assert!(c.blocklist_path.is_none());
+        assert!(c.bypass_token.is_none());
+        assert!(!c.require_integrity);
+    }
+
+    #[test]
+    fn test_curation_config_from_toml() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [curation]
+            mode = "audit"
+            on_failure = "open"
+            require_integrity = true
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.curation.mode, CurationMode::Audit);
+        assert_eq!(config.curation.on_failure, CurationOnFailure::Open);
+        assert!(config.curation.require_integrity);
+        assert_eq!(config.curation.quarantine, None);
+    }
+
+    #[test]
+    fn test_curation_quarantine_from_toml() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [curation]
+            quarantine = "enforce"
+            quarantine_ttl = "14d"
+
+            [curation.docker]
+            quarantine = "observe"
+            quarantine_ttl = "7d"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.curation.quarantine, Some(QuarantineMode::Enforce));
+        assert_eq!(config.curation.quarantine_ttl, Some("14d".to_string()));
+        assert_eq!(
+            config.curation.docker.quarantine,
+            Some(QuarantineMode::Observe)
+        );
+        assert_eq!(
+            config.curation.docker.quarantine_ttl,
+            Some("7d".to_string())
+        );
+        // Other registries should be None
+        assert_eq!(config.curation.npm.quarantine, None);
+    }
+
+    #[test]
+    fn test_curation_config_missing_defaults_to_off() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.curation.mode, CurationMode::Off);
+    }
+
+    #[test]
+    fn test_curation_env_override_mode() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_MODE", "enforce");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.curation.mode, CurationMode::Enforce);
+        std::env::remove_var("NORA_CURATION_MODE");
+    }
+
+    #[test]
+    fn test_curation_env_override_on_failure() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_ON_FAILURE", "open");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.curation.on_failure, CurationOnFailure::Open);
+        std::env::remove_var("NORA_CURATION_ON_FAILURE");
+    }
+
+    #[test]
+    fn test_curation_on_failure_open_emits_error() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.curation.on_failure = CurationOnFailure::Open;
+        let (_warnings, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("on_failure=\"open\" is not implemented")),
+            "expected hard error for on_failure=open"
+        );
+    }
+
+    #[test]
+    fn test_curation_env_override_paths() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_ALLOWLIST_PATH", "/etc/nora/allow.json");
+        std::env::set_var("NORA_CURATION_BLOCKLIST_PATH", "/etc/nora/block.json");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(
+            config.curation.allowlist_path,
+            Some("/etc/nora/allow.json".to_string())
+        );
+        assert_eq!(
+            config.curation.blocklist_path,
+            Some("/etc/nora/block.json".to_string())
+        );
+        std::env::remove_var("NORA_CURATION_ALLOWLIST_PATH");
+        std::env::remove_var("NORA_CURATION_BLOCKLIST_PATH");
+    }
+
+    #[test]
+    fn test_curation_env_override_bypass_token() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_BYPASS_TOKEN", "secret-bypass");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(
+            crate::secrets::expose_opt(&config.curation.bypass_token),
+            Some("secret-bypass")
+        );
+        std::env::remove_var("NORA_CURATION_BYPASS_TOKEN");
+    }
+
+    #[test]
+    fn test_curation_env_override_require_integrity() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_REQUIRE_INTEGRITY", "true");
+        config.apply_env_overrides().unwrap();
+        assert!(config.curation.require_integrity);
+        std::env::remove_var("NORA_CURATION_REQUIRE_INTEGRITY");
+    }
+
+    #[test]
+    fn test_curation_env_override_quarantine() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_QUARANTINE", "observe");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.curation.quarantine, Some(QuarantineMode::Observe));
+        std::env::remove_var("NORA_CURATION_QUARANTINE");
+    }
+
+    #[test]
+    fn test_curation_env_override_quarantine_ttl() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_QUARANTINE_TTL", "14d");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.curation.quarantine_ttl, Some("14d".to_string()));
+        std::env::remove_var("NORA_CURATION_QUARANTINE_TTL");
+    }
+
+    #[test]
+    fn test_curation_env_override_per_registry_quarantine() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_DOCKER_QUARANTINE", "enforce");
+        std::env::set_var("NORA_CURATION_DOCKER_QUARANTINE_TTL", "7d");
+        config.apply_env_overrides().unwrap();
+        assert_eq!(
+            config.curation.docker.quarantine,
+            Some(QuarantineMode::Enforce)
+        );
+        assert_eq!(
+            config.curation.docker.quarantine_ttl,
+            Some("7d".to_string())
+        );
+        // Global should remain None
+        assert_eq!(config.curation.quarantine, None);
+        std::env::remove_var("NORA_CURATION_DOCKER_QUARANTINE");
+        std::env::remove_var("NORA_CURATION_DOCKER_QUARANTINE_TTL");
+    }
+
+    #[test]
+    fn test_quarantine_toml_rejects_typo() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [curation]
+            quarantine = "eforce"
+        "#;
+        let result: Result<Config, _> = toml::from_str(toml);
+        assert!(result.is_err(), "typo 'eforce' should be rejected by serde");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown variant"),
+            "error should mention unknown variant: {err}"
+        );
+    }
+
+    #[test]
+    fn test_curation_mode_env_rejects_typo() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_MODE", "enforec");
+        let result = config.apply_env_overrides();
+        assert!(result.is_err(), "typo 'enforec' should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("NORA_CURATION_MODE"),
+            "error should name the env var: {err}"
+        );
+        std::env::remove_var("NORA_CURATION_MODE");
+    }
+
+    #[test]
+    fn test_quarantine_env_rejects_typo() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        std::env::set_var("NORA_CURATION_QUARANTINE", "enfocre");
+        let result = config.apply_env_overrides();
+        assert!(result.is_err(), "typo 'enfocre' should be rejected");
+        std::env::remove_var("NORA_CURATION_QUARANTINE");
+    }
+
+    #[test]
+    fn test_curation_mode_fromstr() {
+        assert_eq!("off".parse::<CurationMode>().unwrap(), CurationMode::Off);
+        assert_eq!(
+            "audit".parse::<CurationMode>().unwrap(),
+            CurationMode::Audit
+        );
+        assert_eq!(
+            "enforce".parse::<CurationMode>().unwrap(),
+            CurationMode::Enforce
+        );
+        assert_eq!(
+            "ENFORCE".parse::<CurationMode>().unwrap(),
+            CurationMode::Enforce
+        );
+        assert!("typo".parse::<CurationMode>().is_err());
+        assert!("".parse::<CurationMode>().is_err());
+    }
+
+    #[test]
+    fn test_validate_curation_enforce_no_controls() {
+        let _lock = env_lock();
+        // Enforce with no control of any kind enforces nothing → error (#740).
+        let mut config = Config::default();
+        config.curation.mode = CurationMode::Enforce;
+        config.curation.allowlist_path = None;
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("no active control is configured")),
+            "enforce with no controls should be an error"
+        );
+    }
+
+    #[test]
+    fn test_validate_curation_enforce_blocklist_only_ok() {
+        let _lock = env_lock();
+        // #740: enforce must NOT require an allowlist — a blocklist alone is a valid
+        // control. A deny-list-only (or min-age-only / quarantine-only) policy is legit.
+        let mut config = Config::default();
+        config.curation.mode = CurationMode::Enforce;
+        config.curation.allowlist_path = None;
+        config.curation.blocklist_path = Some("/etc/nora/blocklist.json".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("no active control is configured")),
+            "a blocklist alone should satisfy enforce — no allowlist required"
+        );
+    }
+
+    #[test]
+    fn test_validate_minage_proxy_without_date_source_or_quarantine_rejected() {
+        let _lock = env_lock();
+        // min_release_age on an enabled proxy registry with neither
+        // trust_upstream_dates nor an active quarantine = no age control would be
+        // active => rejected (curation-minage-real-age-defer, #741).
+        let mut config = Config::default();
+        config.npm.enabled = true;
+        config.npm.proxy = Some("https://registry.npmjs.org".to_string());
+        config.curation.min_release_age = Some("7d".to_string());
+        config.server.trust_upstream_dates = false;
+        config.curation.quarantine = None;
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("no age control would be active")),
+            "min-age on a proxy with neither trust nor quarantine must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_minage_proxy_with_quarantine_ok() {
+        let _lock = env_lock();
+        // Escape hatch 1: an active quarantine is the unspoofable age control.
+        let mut config = Config::default();
+        config.npm.enabled = true;
+        config.npm.proxy = Some("https://registry.npmjs.org".to_string());
+        config.curation.min_release_age = Some("7d".to_string());
+        config.server.trust_upstream_dates = false;
+        config.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("no age control would be active")),
+            "an active quarantine should satisfy the age-control requirement"
+        );
+    }
+
+    #[test]
+    fn test_validate_minage_proxy_trust_alone_still_rejected() {
+        let _lock = env_lock();
+        // trust_upstream_dates is NOT a sufficient substitute for the quarantine: it
+        // yields a real date only where a registry caches one (npm); for pypi/cargo/
+        // nuget/gems/… publish_date stays None and min-age silently does nothing, so
+        // min-age on a proxy still requires an active quarantine. (#741)
+        let mut config = Config::default();
+        config.npm.enabled = true;
+        config.npm.proxy = Some("https://registry.npmjs.org".to_string());
+        config.curation.min_release_age = Some("7d".to_string());
+        config.server.trust_upstream_dates = true;
+        config.curation.quarantine = None;
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("no age control would be active")),
+            "trust alone (no quarantine) must still be rejected — trust is not a substitute"
+        );
+    }
+
+    #[test]
+    fn test_is_enabled_proxy_counts_docker_and_excludes_raw() {
+        // #765: docker was dropped from the any_enabled_proxy chain. The exhaustive
+        // helper must count docker (enabled + has upstream) and never count raw.
+        let mut config = Config::default();
+        // Config::default() already carries the registry-1.docker.io upstream.
+        assert!(
+            config.is_enabled_proxy(RegistryType::Docker),
+            "enabled docker with an upstream is a proxy"
+        );
+        config.docker.upstreams = vec![];
+        assert!(
+            !config.is_enabled_proxy(RegistryType::Docker),
+            "docker without upstreams is not a proxy"
+        );
+        assert!(
+            !config.is_enabled_proxy(RegistryType::Raw),
+            "raw has no upstream and is never a proxy"
+        );
+    }
+
+    #[test]
+    fn test_quarantine_mode_for_docker_precedence_and_raw_off() {
+        // Per-registry override wins over global (.or precedence, matching
+        // docker.rs::resolve_quarantine); raw is always Off (no enforcement path).
+        let mut config = Config::default();
+        config.curation.quarantine = Some(QuarantineMode::Off);
+        config.curation.docker.quarantine = Some(QuarantineMode::Enforce);
+        assert_eq!(
+            config.quarantine_mode_for(RegistryType::Docker),
+            QuarantineMode::Enforce,
+            "docker override Enforce beats global Off"
+        );
+        assert_eq!(
+            config.quarantine_mode_for(RegistryType::Npm),
+            QuarantineMode::Off,
+            "npm with no override inherits global Off"
+        );
+        // raw stays Off even under a global Enforce — counting it would be a phantom control.
+        config.curation.quarantine = Some(QuarantineMode::Enforce);
+        assert_eq!(
+            config.quarantine_mode_for(RegistryType::Raw),
+            QuarantineMode::Off,
+            "raw must never report an active quarantine"
+        );
+    }
+
+    #[test]
+    fn test_any_quarantine_active_counts_docker_only_override() {
+        // #765 core: a docker-only [curation.docker] quarantine, no global, must count.
+        // The main.rs DigestStore gate depends on this — otherwise it builds an
+        // empty() (non-durable) store and serves young digests early after restart.
+        let mut config = Config::default();
+        config.curation.quarantine = None;
+        config.curation.docker.quarantine = Some(QuarantineMode::Enforce);
+        assert!(
+            config.any_quarantine_active(),
+            "docker-only quarantine override must count as active"
+        );
+    }
+
+    #[test]
+    fn test_any_quarantine_active_false_when_global_fully_overridden_off() {
+        // A global Enforce with EVERY registry overridden to Off enforces nothing,
+        // so quarantine is not active. (The old flat-OR counted the global term and
+        // wrongly reported active — which would suppress the #741 min-age guard.)
+        let mut config = Config::default();
+        config.curation.quarantine = Some(QuarantineMode::Enforce);
+        for o in [
+            &mut config.curation.docker,
+            &mut config.curation.maven,
+            &mut config.curation.npm,
+            &mut config.curation.cargo,
+            &mut config.curation.pypi,
+            &mut config.curation.go,
+            &mut config.curation.gems,
+            &mut config.curation.terraform,
+            &mut config.curation.ansible,
+            &mut config.curation.nuget,
+            &mut config.curation.pub_dart,
+            &mut config.curation.conan,
+            &mut config.curation.rpm,
+            &mut config.curation.deb,
+            &mut config.curation.cpan,
+        ] {
+            o.quarantine = Some(QuarantineMode::Off);
+        }
+        assert!(
+            !config.any_quarantine_active(),
+            "global Enforce fully overridden to Off everywhere enforces nothing"
+        );
+    }
+
+    #[test]
+    fn test_validate_minage_docker_only_quarantine_ok() {
+        let _lock = env_lock();
+        // #765: a docker-only quarantine must SATISFY the #741 min-age guard. The
+        // old quarantine_active chain omitted docker and falsely rejected this config.
+        let mut config = Config::default();
+        config.curation.min_release_age = Some("7d".to_string());
+        config.server.trust_upstream_dates = false;
+        config.curation.quarantine = None;
+        config.curation.docker.quarantine = Some(QuarantineMode::Enforce);
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("no age control would be active")),
+            "a docker-only quarantine should satisfy the age-control requirement (#765)"
+        );
+    }
+
+    /// A config with npm hosted only (no upstream) and nothing else that curates.
+    fn npm_hosted_only() -> Config {
+        let mut config = Config::default();
+        config.npm.enabled = true;
+        config.npm.proxy = None;
+        config.npm.proxies.clear();
+        config.server.trust_upstream_dates = false;
+        config.curation.quarantine = None;
+        config
+    }
+
+    #[test]
+    fn a_per_registry_min_release_age_is_an_active_control_in_enforce() {
+        let _lock = env_lock();
+        // #1098: `[curation.npm] min_release_age` alone is a control enforce can apply.
+        let mut config = npm_hosted_only();
+        config.curation.mode = CurationMode::Enforce;
+        config.curation.npm.min_release_age = Some("3d".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("no active control is configured")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_per_registry_min_release_age_on_a_proxy_needs_a_quarantine() {
+        let _lock = env_lock();
+        // #1098: the #741 rule covers a per-registry value too, and names it.
+        let mut config = npm_hosted_only();
+        config.npm.proxy = Some("https://registry.npmjs.org".to_string());
+        config.curation.npm.min_release_age = Some("3d".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("curation.npm.min_release_age")
+                    && e.contains("no age control would be active")),
+            "{errors:?}"
+        );
+        // A quarantine of npm satisfies it — npm's own or the global one. One on
+        // another registry does not: it holds none of npm's downloads.
+        for (npm, global, docker, satisfied) in [
+            (Some(QuarantineMode::Observe), None, None, true),
+            (None, Some(QuarantineMode::Enforce), None, true),
+            (None, None, Some(QuarantineMode::Enforce), false),
+            (
+                Some(QuarantineMode::Off),
+                Some(QuarantineMode::Enforce),
+                None,
+                false,
+            ),
+        ] {
+            config.curation.npm.quarantine = npm.clone();
+            config.curation.quarantine = global.clone();
+            config.curation.docker.quarantine = docker.clone();
+            let (_, errors) = config.validate_with_config_path(None);
+            let refused = errors.iter().any(|e| {
+                e.contains("curation.npm.min_release_age")
+                    && e.contains("no age control would be active")
+            });
+            assert_eq!(
+                refused, !satisfied,
+                "npm {npm:?}, global {global:?}, docker {docker:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_per_registry_min_release_age_on_a_hosted_registry_needs_no_quarantine() {
+        let _lock = env_lock();
+        // Hosted packages are dated by NORA's own clock: nothing for a quarantine to back.
+        let mut config = npm_hosted_only();
+        config.curation.npm.min_release_age = Some("3d".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors.iter().any(|e| e.contains("min_release_age")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_min_release_age_for_rpm_or_deb_is_refused() {
+        let _lock = env_lock();
+        // rpm and deb downloads are not checked by name or release date: the value
+        // could never apply, so startup says so instead of accepting it (#1098).
+        for registry in ["rpm", "deb"] {
+            let mut config = npm_hosted_only();
+            config.curation.quarantine = Some(QuarantineMode::Enforce);
+            let value = Some("3d".to_string());
+            match registry {
+                "rpm" => config.curation.rpm.min_release_age = value,
+                _ => config.curation.deb.min_release_age = value,
+            }
+            let (_, errors) = config.validate_with_config_path(None);
+            let key = format!("curation.{registry}.min_release_age");
+            assert!(
+                errors.iter().any(|e| e.contains(&key)
+                    && e.contains("not checked by name or release date")
+                    && !e.contains("no age control would be active")),
+                "{registry}: {errors:?}"
+            );
+        }
+    }
+
+    /// The registries with a `[curation.<registry>]` section: all but Raw and Hugging Face.
+    fn registries_with_a_curation_section() -> Vec<RegistryType> {
+        RegistryType::all()
+            .iter()
+            .copied()
+            .filter(|rt| !matches!(rt, RegistryType::Raw | RegistryType::HuggingFace))
+            .collect()
+    }
+
+    /// #1098: the verdict on a registry's own min_release_age, row by row, from facts
+    /// alone (value set, release-date check, enabled, proxy, quarantine of that registry).
+    #[test]
+    fn registry_min_age_verdict_is_decided_by_the_facts_alone() {
+        use RegistryMinAgeVerdict::{Applies, CannotApply, NeedsQuarantine, NotSet, Unused};
+        use ReleaseDateCheck::{Dated, NoDate, NoNameOrDate};
+        let facts = |value_set, dated, enabled, proxy, quarantined| RegistryMinAgeFacts {
+            value_set,
+            dated,
+            enabled,
+            proxy,
+            quarantined,
+        };
+        // (dated, enabled, proxy, quarantined) -> verdict, with the value set.
+        let rows = [
+            (Dated, true, true, true, Applies),
+            (Dated, true, true, false, NeedsQuarantine),
+            (Dated, true, false, true, Applies),
+            (Dated, true, false, false, Applies),
+            (Dated, false, true, true, Unused),
+            (Dated, false, true, false, Unused),
+            (Dated, false, false, true, Unused),
+            (Dated, false, false, false, Unused),
+            (NoDate, true, true, true, CannotApply),
+            (NoDate, true, true, false, CannotApply),
+            (NoDate, true, false, true, CannotApply),
+            (NoDate, true, false, false, CannotApply),
+            (NoDate, false, true, true, CannotApply),
+            (NoDate, false, true, false, CannotApply),
+            (NoDate, false, false, true, CannotApply),
+            (NoDate, false, false, false, CannotApply),
+            (NoNameOrDate, true, true, true, CannotApply),
+            (NoNameOrDate, true, true, false, CannotApply),
+            (NoNameOrDate, true, false, true, CannotApply),
+            (NoNameOrDate, true, false, false, CannotApply),
+            (NoNameOrDate, false, true, true, CannotApply),
+            (NoNameOrDate, false, true, false, CannotApply),
+            (NoNameOrDate, false, false, true, CannotApply),
+            (NoNameOrDate, false, false, false, CannotApply),
+        ];
+        for (dated, enabled, proxy, quarantined, verdict) in rows {
+            let f = facts(true, dated, enabled, proxy, quarantined);
+            assert_eq!(registry_min_age_verdict(f), verdict, "{f:?}");
+            // Without a value there is nothing to decide.
+            let f = facts(false, dated, enabled, proxy, quarantined);
+            assert_eq!(registry_min_age_verdict(f), NotSet, "{f:?}");
+        }
+    }
+
+    /// Whether each registry's downloads reach curation with a release date, as the
+    /// handlers call it: rpm and deb are not checked by name or date, cpan passes no date.
+    #[test]
+    fn the_release_date_check_of_every_registry() {
+        use ReleaseDateCheck::{Dated, NoDate, NoNameOrDate};
+        let expected = [
+            (RegistryType::Docker, Dated),
+            (RegistryType::Maven, Dated),
+            (RegistryType::Npm, Dated),
+            (RegistryType::Cargo, Dated),
+            (RegistryType::PyPI, Dated),
+            (RegistryType::Go, Dated),
+            (RegistryType::Raw, Dated),
+            (RegistryType::Gems, Dated),
+            (RegistryType::Terraform, Dated),
+            (RegistryType::Ansible, Dated),
+            (RegistryType::Nuget, Dated),
+            (RegistryType::PubDart, Dated),
+            (RegistryType::Conan, Dated),
+            (RegistryType::Rpm, NoNameOrDate),
+            (RegistryType::Deb, NoNameOrDate),
+            (RegistryType::Cpan, NoDate),
+            (RegistryType::HuggingFace, NoDate),
+        ];
+        assert_eq!(expected.len(), RegistryType::all().len());
+        for (rt, check) in expected {
+            assert_eq!(release_date_check(rt), check, "{rt}");
+        }
+    }
+
+    /// Each registry made an enabled proxy in each form its config accepts, written out
+    /// per registry: the expectation is this table, not `is_enabled_proxy`.
+    fn proxy_forms() -> Vec<(RegistryType, &'static str, fn(&mut Config))> {
+        fn none(_: &mut Config) {}
+        vec![
+            (RegistryType::Docker, "[docker]\nenabled = true\n[[docker.upstreams]]\nurl = \"https://registry-1.docker.io\"\n", none),
+            (RegistryType::Maven, "[maven]\nenabled = true\nproxies = [\"https://repo1.maven.org/maven2\"]\n", none),
+            (RegistryType::Npm, "[npm]\nenabled = true\nproxy = \"https://registry.npmjs.org\"\n", |c| c.npm.proxies.clear()),
+            (RegistryType::Npm, "[npm]\nenabled = true\nproxies = [\"https://registry.npmjs.org\"]\n", |c| c.npm.proxy = None),
+            (RegistryType::Cargo, "[cargo]\nenabled = true\nproxy = \"https://index.crates.io\"\n", none),
+            (RegistryType::PyPI, "[pypi]\nenabled = true\nproxy = \"https://pypi.org/simple/\"\n", |c| c.pypi.proxies.clear()),
+            (RegistryType::PyPI, "[pypi]\nenabled = true\nproxies = [\"https://pypi.org/simple/\"]\n", |c| c.pypi.proxy = None),
+            (RegistryType::Go, "[go]\nenabled = true\nproxy = \"https://proxy.golang.org\"\n", none),
+            (RegistryType::Gems, "[gems]\nenabled = true\nproxy = \"https://rubygems.org\"\n", none),
+            (RegistryType::Terraform, "[terraform]\nenabled = true\nproxy = \"https://registry.terraform.io\"\n", none),
+            (RegistryType::Ansible, "[ansible]\nenabled = true\nproxy = \"https://galaxy.ansible.com\"\n", none),
+            (RegistryType::Nuget, "[nuget]\nenabled = true\nproxy = \"https://api.nuget.org/v3/index.json\"\n", none),
+            (RegistryType::PubDart, "[pub_dart]\nenabled = true\nproxy = \"https://pub.dev\"\n", none),
+            (RegistryType::Conan, "[conan]\nenabled = true\nproxy = \"https://center2.conan.io\"\n", none),
+            (RegistryType::Rpm, "[rpm]\nenabled = true\n[rpm.proxies]\nfedora = \"https://repo.example.com/fedora\"\n", none),
+            (RegistryType::Deb, "[deb]\nenabled = true\n[deb.proxies]\ndebian = \"https://deb.debian.org/debian\"\n", none),
+            (RegistryType::Cpan, "[cpan]\nenabled = true\nproxy = \"https://www.cpan.org\"\n", none),
+        ]
+    }
+
+    /// Each registry enabled with no upstream at all, written out per registry.
+    fn make_hosted(rt: RegistryType, c: &mut Config) {
+        match rt {
+            RegistryType::Docker => (c.docker.enabled, c.docker.upstreams) = (true, vec![]),
+            RegistryType::Maven => (c.maven.enabled, c.maven.proxies) = (true, vec![]),
+            RegistryType::Npm => (c.npm.enabled, c.npm.proxy, c.npm.proxies) = (true, None, vec![]),
+            RegistryType::Cargo => (c.cargo.enabled, c.cargo.proxy) = (true, None),
+            RegistryType::PyPI => {
+                (c.pypi.enabled, c.pypi.proxy, c.pypi.proxies) = (true, None, vec![])
+            }
+            RegistryType::Go => (c.go.enabled, c.go.proxy) = (true, None),
+            RegistryType::Gems => (c.gems.enabled, c.gems.proxy) = (true, None),
+            RegistryType::Terraform => (c.terraform.enabled, c.terraform.proxy) = (true, None),
+            RegistryType::Ansible => (c.ansible.enabled, c.ansible.proxy) = (true, None),
+            RegistryType::Nuget => (c.nuget.enabled, c.nuget.proxy) = (true, None),
+            RegistryType::PubDart => (c.pub_dart.enabled, c.pub_dart.proxy) = (true, None),
+            RegistryType::Conan => (c.conan.enabled, c.conan.proxy) = (true, None),
+            RegistryType::Rpm => (c.rpm.enabled, c.rpm.proxies) = (true, Default::default()),
+            RegistryType::Deb => (c.deb.enabled, c.deb.proxies) = (true, Default::default()),
+            RegistryType::Cpan => (c.cpan.enabled, c.cpan.proxy) = (true, None),
+            RegistryType::Raw => c.raw.enabled = true,
+            RegistryType::HuggingFace => (c.hf.enabled, c.hf.proxy) = (true, None),
+        }
+    }
+
+    /// Each registry disabled, written out per registry.
+    fn make_disabled(rt: RegistryType, c: &mut Config) {
+        match rt {
+            RegistryType::Docker => c.docker.enabled = false,
+            RegistryType::Maven => c.maven.enabled = false,
+            RegistryType::Npm => c.npm.enabled = false,
+            RegistryType::Cargo => c.cargo.enabled = false,
+            RegistryType::PyPI => c.pypi.enabled = false,
+            RegistryType::Go => c.go.enabled = false,
+            RegistryType::Gems => c.gems.enabled = false,
+            RegistryType::Terraform => c.terraform.enabled = false,
+            RegistryType::Ansible => c.ansible.enabled = false,
+            RegistryType::Nuget => c.nuget.enabled = false,
+            RegistryType::PubDart => c.pub_dart.enabled = false,
+            RegistryType::Conan => c.conan.enabled = false,
+            RegistryType::Rpm => c.rpm.enabled = false,
+            RegistryType::Deb => c.deb.enabled = false,
+            RegistryType::Cpan => c.cpan.enabled = false,
+            RegistryType::Raw => c.raw.enabled = false,
+            RegistryType::HuggingFace => c.hf.enabled = false,
+        }
+    }
+
+    /// A config from `toml`, then `fixup`.
+    fn config_from(toml: &str, fixup: fn(&mut Config)) -> Config {
+        let (mut config, unknown) = parse_config(toml).unwrap_or_else(|e| panic!("{e}\n{toml}"));
+        assert!(unknown.is_empty(), "{toml}: {unknown:?}");
+        fixup(&mut config);
+        config
+    }
+
+    #[test]
+    fn every_proxy_form_of_every_registry_is_an_enabled_proxy() {
+        let _lock = env_lock();
+        let forms = proxy_forms();
+        // Every registry with a section has at least one form here.
+        for rt in registries_with_a_curation_section() {
+            assert!(
+                forms.iter().any(|(r, _, _)| *r == rt),
+                "{rt} has no proxy form"
+            );
+        }
+        for (rt, toml, fixup) in forms {
+            let mut config = config_from(toml, fixup);
+            assert!(config.is_enabled_proxy(rt), "{rt}: {toml}");
+            let facts = config.registry_min_age_facts(rt);
+            assert!(facts.enabled && facts.proxy, "{rt}: {facts:?}");
+            make_hosted(rt, &mut config);
+            assert!(!config.is_enabled_proxy(rt), "{rt} hosted");
+            assert!(config.registry_min_age_facts(rt).enabled, "{rt} hosted");
+            make_disabled(rt, &mut config);
+            let facts = config.registry_min_age_facts(rt);
+            assert!(!facts.enabled && !facts.proxy, "{rt} disabled: {facts:?}");
+        }
+    }
+
+    /// Startup, end to end, for every registry with a section in every proxy form: the
+    /// verdict the facts call for, under the message that names its key. The
+    /// expectation comes from the scenario and the release-date table above.
+    #[test]
+    fn every_per_registry_min_release_age_gets_its_verdict_at_startup() {
+        let _lock = env_lock();
+        #[derive(Clone, Copy, Debug)]
+        enum Setup {
+            ProxyNoQuarantine,
+            ProxyNoQuarantineTrustedDates,
+            ProxyOwnQuarantine,
+            ProxyGlobalQuarantine,
+            ProxyOwnOffGlobalOn,
+            ProxyOtherRegistryQuarantine,
+            Hosted,
+            Disabled,
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (rt, toml, fixup) in proxy_forms() {
+            let dated = !matches!(
+                rt,
+                RegistryType::Rpm | RegistryType::Deb | RegistryType::Cpan
+            );
+            let other = if rt == RegistryType::Docker {
+                "npm"
+            } else {
+                "docker"
+            };
+            for setup in [
+                Setup::ProxyNoQuarantine,
+                Setup::ProxyNoQuarantineTrustedDates,
+                Setup::ProxyOwnQuarantine,
+                Setup::ProxyGlobalQuarantine,
+                Setup::ProxyOwnOffGlobalOn,
+                Setup::ProxyOtherRegistryQuarantine,
+                Setup::Hosted,
+                Setup::Disabled,
+            ] {
+                for mode in ["off", "enforce"] {
+                    let mut curation = format!("[curation]\nmode = \"{mode}\"\n");
+                    let mut own = format!("[curation.{rt}]\nmin_release_age = \"3d\"\n");
+                    match setup {
+                        Setup::ProxyOwnQuarantine => own.push_str("quarantine = \"observe\"\n"),
+                        Setup::ProxyGlobalQuarantine => {
+                            curation.push_str("quarantine = \"enforce\"\n")
+                        }
+                        Setup::ProxyOwnOffGlobalOn => {
+                            curation.push_str("quarantine = \"enforce\"\n");
+                            own.push_str("quarantine = \"off\"\n");
+                        }
+                        Setup::ProxyOtherRegistryQuarantine => {
+                            own.push_str(&format!("[curation.{other}]\nquarantine = \"enforce\"\n"))
+                        }
+                        _ => {}
+                    }
+                    let content = format!("{toml}{curation}{own}");
+                    let mut config = config_from(&content, fixup);
+                    match setup {
+                        Setup::ProxyNoQuarantineTrustedDates => {
+                            config.server.trust_upstream_dates = true
+                        }
+                        Setup::Hosted => make_hosted(rt, &mut config),
+                        Setup::Disabled => make_disabled(rt, &mut config),
+                        _ => {}
+                    }
+                    let key = format!("curation.{rt}.min_release_age=\"3d\"");
+                    let (warnings, errors) = config.validate_with_config_path(None);
+                    let named = |list: &[String], what: &str| {
+                        list.iter().any(|e| e.contains(&key) && e.contains(what))
+                    };
+                    let cannot = named(&errors, "cannot apply");
+                    let needs = named(&errors, "no age control would be active");
+                    let unused = named(&warnings, "is not enabled");
+                    let no_control = errors
+                        .iter()
+                        .any(|e| e.contains("no active control is configured"));
+                    let (e_cannot, e_needs, e_unused, applies) = if !dated {
+                        (true, false, false, false)
+                    } else {
+                        match setup {
+                            Setup::Disabled => (false, false, true, false),
+                            Setup::ProxyNoQuarantine
+                            | Setup::ProxyNoQuarantineTrustedDates
+                            | Setup::ProxyOwnOffGlobalOn
+                            | Setup::ProxyOtherRegistryQuarantine => (false, true, false, false),
+                            Setup::ProxyOwnQuarantine
+                            | Setup::ProxyGlobalQuarantine
+                            | Setup::Hosted => (false, false, false, true),
+                        }
+                    };
+                    let case = format!("{rt} {setup:?} {mode}: {content}\nwarnings {warnings:?}\nerrors {errors:?}");
+                    assert_eq!(
+                        (cannot, needs, unused),
+                        (e_cannot, e_needs, e_unused),
+                        "{case}"
+                    );
+                    // In enforce, the value is the only control unless a quarantine is
+                    // configured: it counts exactly when it applies.
+                    let quarantine_configured = matches!(
+                        setup,
+                        Setup::ProxyOwnQuarantine
+                            | Setup::ProxyGlobalQuarantine
+                            | Setup::ProxyOwnOffGlobalOn
+                            | Setup::ProxyOtherRegistryQuarantine
+                    );
+                    if mode == "enforce" && !quarantine_configured {
+                        assert_eq!(no_control, !applies, "{case}");
+                    }
+                    seen.insert(rt.to_string());
+                }
+            }
+        }
+        assert_eq!(seen.len(), registries_with_a_curation_section().len());
+    }
+
+    /// How a test enables (or disables) one registry.
+    #[derive(Clone, Copy, Debug)]
+    enum EnableWay {
+        /// `NORA_REGISTRIES_ENABLE`.
+        Env,
+        /// `[registries] enable` in the file.
+        Section,
+        /// The registry's own `enabled` flag.
+        Flag,
+    }
+
+    /// `Config::load_from` a file holding `toml`, with `NORA_REGISTRIES_ENABLE` set to
+    /// `env` for the call: the config, or the errors that refused it.
+    fn load_toml(toml: &str, env: Option<&str>) -> Result<Config, Vec<String>> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        match env {
+            Some(v) => std::env::set_var("NORA_REGISTRIES_ENABLE", v),
+            None => std::env::remove_var("NORA_REGISTRIES_ENABLE"),
+        }
+        let loaded = Config::load_from(
+            Some(path.to_string_lossy().into_owned()),
+            NO_FALLBACK,
+            false,
+        );
+        std::env::remove_var("NORA_REGISTRIES_ENABLE");
+        match loaded {
+            Ok((config, _)) => Ok(config),
+            Err(ConfigLoadError::Invalid(errors)) => Err(errors),
+            Err(e) => panic!("{e}\n{toml}"),
+        }
+    }
+
+    /// The verdict on a registry's own value does not depend on how the registry is
+    /// enabled: NORA_REGISTRIES_ENABLE, [registries].enable and its own flag give the same
+    /// answer, for the registry on and off (the first two used to be judged by the flags'
+    /// defaults, before the enable-set was applied).
+    #[test]
+    fn a_per_registry_min_release_age_is_judged_by_the_registries_the_server_mounts() {
+        let _lock = env_lock();
+        let mut seen = 0;
+        for (rt, form, _) in proxy_forms() {
+            if !matches!(release_date_check(rt), ReleaseDateCheck::Dated) {
+                continue;
+            }
+            // The upstream stays configured; only the way it is enabled changes.
+            let section: String = form
+                .lines()
+                .filter(|l| !l.starts_with("enabled = "))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            let value = format!("[curation.{rt}]\nmin_release_age = \"3d\"\n");
+            let key = format!("curation.{rt}.min_release_age=\"3d\"");
+            let other = if rt == RegistryType::Raw {
+                "docker"
+            } else {
+                "raw"
+            };
+            for way in [EnableWay::Env, EnableWay::Section, EnableWay::Flag] {
+                for on in [true, false] {
+                    let flag = |v: bool| section.replacen("\n", &format!("\nenabled = {v}\n"), 1);
+                    let (toml, env) = match (way, on) {
+                        (EnableWay::Env, true) => {
+                            (format!("{section}{value}"), Some(rt.as_str().to_string()))
+                        }
+                        (EnableWay::Env, false) => {
+                            (format!("{section}{value}"), Some(other.to_string()))
+                        }
+                        (EnableWay::Section, true) => (
+                            format!("[registries]\nenable = [\"{rt}\"]\n{section}{value}"),
+                            None,
+                        ),
+                        (EnableWay::Section, false) => (
+                            format!("[registries]\nenable = [\"{other}\"]\n{section}{value}"),
+                            None,
+                        ),
+                        (EnableWay::Flag, true) => (format!("{}{value}", flag(true)), None),
+                        (EnableWay::Flag, false) => (format!("{}{value}", flag(false)), None),
+                    };
+                    let case = format!("{rt} {way:?} on={on}: {toml} env={env:?}");
+                    match load_toml(&toml, env.as_deref()) {
+                        Err(errors) => {
+                            assert!(on, "{case}: refused although {rt} is off: {errors:?}");
+                            assert!(
+                                errors.iter().any(|e| e.contains(&key)
+                                    && e.contains("no age control would be active")),
+                                "{case}: {errors:?}"
+                            );
+                        }
+                        Ok(config) => {
+                            assert!(
+                                !on,
+                                "{case}: started without a quarantine of an enabled proxy"
+                            );
+                            let (warnings, errors) = config.validate();
+                            assert!(errors.is_empty(), "{case}: {errors:?}");
+                            assert!(
+                                warnings
+                                    .iter()
+                                    .any(|w| w.contains(&key) && w.contains("is not enabled")),
+                                "{case}: {warnings:?}"
+                            );
+                        }
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        assert!(seen >= 60, "{seen} cases");
+    }
+
+    /// A reload (SIGHUP) judges the same registries as the start.
+    #[test]
+    fn a_reload_judges_the_registries_the_server_mounts() {
+        let _lock = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // docker is on by its flag's default and a proxy; the enable-set decides.
+        std::fs::write(&path, "[curation.docker]\nmin_release_age = \"3d\"\n").unwrap();
+        std::env::set_var("NORA_CONFIG_PATH", &path);
+        std::env::set_var("NORA_REGISTRIES_ENABLE", "raw");
+        let off = Config::try_load();
+        std::env::set_var("NORA_REGISTRIES_ENABLE", "docker");
+        let on = Config::try_load();
+        std::env::remove_var("NORA_REGISTRIES_ENABLE");
+        std::env::remove_var("NORA_CONFIG_PATH");
+        assert!(off.is_ok(), "docker is not mounted: {:?}", off.err());
+        let err = on.expect_err("docker is a mounted proxy without a quarantine");
+        assert!(err.contains("curation.docker.min_release_age"), "{err}");
+    }
+
+    /// The Hugging Face rule and the global #741 rule judge the mounted registries too.
+    #[test]
+    fn the_global_min_release_age_rules_judge_the_registries_the_server_mounts() {
+        let _lock = env_lock();
+        let hf = "[hf]\nproxy = \"http://127.0.0.1:9\"\n[curation]\nmin_release_age = \"3d\"\nquarantine = \"enforce\"\n";
+        for (toml, env) in [
+            (hf.to_string(), Some("all,hf")),
+            (
+                format!("[registries]\nenable = [\"all\", \"hf\"]\n{hf}"),
+                None,
+            ),
+            (hf.replacen("[hf]\n", "[hf]\nenabled = true\n", 1), None),
+        ] {
+            let errors = load_toml(&toml, env).err().unwrap_or_else(|| {
+                panic!("hf with a global min_release_age started: {toml} {env:?}")
+            });
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("cannot hold the Hugging Face proxy")),
+                "{errors:?}"
+            );
+        }
+        // Control: hf off, the same global value starts.
+        assert!(load_toml(hf, Some("all")).is_ok());
+        // #741: every per-registry flag off in the file, NORA_REGISTRIES_ENABLE=all mounts
+        // the proxies, so a global value without a quarantine is refused.
+        let mut all_off = String::new();
+        for rt in RegistryType::all() {
+            let section = match rt {
+                RegistryType::PubDart => "pub_dart".to_string(),
+                _ => rt.as_str().to_string(),
+            };
+            all_off.push_str(&format!("[{section}]\nenabled = false\n"));
+        }
+        all_off.push_str("[curation]\nmin_release_age = \"3d\"\n");
+        let errors = load_toml(&all_off, Some("all")).expect_err("the proxies are mounted");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e
+                    .starts_with("curation.min_release_age is set with an enabled proxy registry")),
+            "{errors:?}"
+        );
+        // And only raw mounted: no proxy is served, nothing to refuse.
+        assert!(load_toml("[curation]\nmin_release_age = \"3d\"\n", Some("raw")).is_ok());
+    }
+
+    #[test]
+    fn a_min_release_age_for_rpm_or_deb_is_refused_for_its_own_reason_without_a_quarantine() {
+        let _lock = env_lock();
+        // On an enabled rpm or deb proxy with no quarantine, the refusal still gives
+        // the reason the value can never apply, not the quarantine one.
+        for registry in ["rpm", "deb"] {
+            let content = format!(
+                "[{registry}]\nenabled = true\n[{registry}.proxies]\nupstream = \"https://repo.example.com/{registry}\"\n[curation.{registry}]\nmin_release_age = \"3d\"\n"
+            );
+            let (config, unknown) = parse_config(&content).unwrap();
+            assert!(unknown.is_empty(), "{content}: {unknown:?}");
+            let rt = RegistryType::from_str_opt(registry).unwrap();
+            assert!(config.is_enabled_proxy(rt), "{content}");
+            let (_, errors) = config.validate_with_config_path(None);
+            let key = format!("curation.{registry}.min_release_age");
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains(&key) && e.contains("not checked by name or release date")),
+                "{registry}: {errors:?}"
+            );
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.contains(&key) && e.contains("no age control would be active")),
+                "{registry}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_min_release_age_for_cpan_is_refused_its_downloads_carry_no_release_date() {
+        let _lock = env_lock();
+        // registry/cpan.rs asks curation with no publish date, so a cpan threshold is
+        // never compared: refused like rpm and deb, for its own reason, with or
+        // without a quarantine, enabled or not (#1098).
+        for quarantine in ["", "quarantine = \"enforce\"\n"] {
+            for enabled in [true, false] {
+                let content = format!(
+                    "[cpan]\nenabled = {enabled}\nproxy = \"https://www.cpan.org\"\n[curation.cpan]\nmin_release_age = \"3d\"\n{quarantine}"
+                );
+                let (config, unknown) = parse_config(&content).unwrap();
+                assert!(unknown.is_empty(), "{content}: {unknown:?}");
+                let (warnings, errors) = config.validate_with_config_path(None);
+                let key = "curation.cpan.min_release_age=\"3d\" cannot apply";
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.contains(key) && e.contains("carry no release date")),
+                    "{content}: {errors:?}"
+                );
+                assert!(
+                    !errors
+                        .iter()
+                        .chain(&warnings)
+                        .any(|e| e.contains("curation.cpan.min_release_age")
+                            && (e.contains("no age control would be active")
+                                || e.contains("is not enabled"))),
+                    "{content}: {warnings:?} {errors:?}"
+                );
+            }
+        }
+    }
+
+    /// The environment variable of each `[curation.<registry>]` section, as documented.
+    fn curation_env_name(rt: RegistryType) -> Option<&'static str> {
+        match rt {
+            RegistryType::Docker => Some("DOCKER"),
+            RegistryType::Maven => Some("MAVEN"),
+            RegistryType::Npm => Some("NPM"),
+            RegistryType::Cargo => Some("CARGO"),
+            RegistryType::PyPI => Some("PYPI"),
+            RegistryType::Go => Some("GO"),
+            RegistryType::Raw => None,
+            RegistryType::Gems => Some("GEMS"),
+            RegistryType::Terraform => Some("TERRAFORM"),
+            RegistryType::Ansible => Some("ANSIBLE"),
+            RegistryType::Nuget => Some("NUGET"),
+            RegistryType::PubDart => Some("PUB"),
+            RegistryType::Conan => Some("CONAN"),
+            RegistryType::Rpm => Some("RPM"),
+            RegistryType::Deb => Some("DEB"),
+            RegistryType::Cpan => Some("CPAN"),
+            RegistryType::HuggingFace => None,
+        }
+    }
+
+    #[test]
+    fn every_per_registry_min_release_age_is_read_from_its_environment_variable() {
+        let _lock = env_lock();
+        for rt in registries_with_a_curation_section() {
+            let var = format!(
+                "NORA_CURATION_{}_MIN_RELEASE_AGE",
+                curation_env_name(rt).unwrap()
+            );
+            let mut curation = CurationConfig::default();
+            std::env::set_var(&var, "3d");
+            let applied = curation.apply_env_overrides();
+            std::env::remove_var(&var);
+            applied.unwrap();
+            // Its own section has it, and no other does.
+            for &other in RegistryType::all() {
+                let value = curation
+                    .registry_override(other)
+                    .and_then(|o| o.min_release_age.as_deref());
+                assert_eq!(value, (other == rt).then_some("3d"), "{var}: {other}");
+            }
+        }
+    }
+
+    /// A request for `registry` published `publish_date`.
+    fn age_request(
+        registry: RegistryType,
+        publish_date: Option<i64>,
+    ) -> crate::curation::FilterRequest {
+        crate::curation::FilterRequest {
+            registry,
+            upstream: None,
+            name: "pkg".to_string(),
+            version: crate::curation::RequestVersion::Known("1.0.0".to_string()),
+            integrity: None,
+            bypass: false,
+            publish_date,
+        }
+    }
+
+    #[test]
+    fn every_per_registry_min_release_age_alone_holds_its_registry_and_names_it() {
+        use crate::curation::{Decision, MinReleaseAgeFilter, ProxyFilter};
+        let _lock = env_lock();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for rt in registries_with_a_curation_section() {
+            let config = curation_toml(&format!("curation.{rt}.min_release_age"), "3d", "off");
+            let (filter, problems) = MinReleaseAgeFilter::from_config(&config.curation);
+            assert!(problems.is_empty(), "{rt}: {problems:?}");
+            let filter = filter.unwrap_or_else(|| panic!("{rt}: no filter"));
+            // The log line and `curation explain` show it.
+            assert_eq!(filter.summary(), format!("{rt}: 3d"));
+            // A release an hour old is held in its registry and not filtered by age
+            // anywhere else.
+            for &other in RegistryType::all() {
+                let decision = filter.evaluate(&age_request(other, Some(now - 3600)));
+                if other == rt {
+                    assert!(
+                        matches!(&decision, Decision::Block { rule, .. } if rule == "min-release-age"),
+                        "{rt}: {decision:?}"
+                    );
+                } else {
+                    assert_eq!(decision, Decision::Skip, "{rt} set, {other} asked");
+                }
+            }
+            // Beside a global value, the registry's own wins in its registry, and the
+            // global one holds the others: a release two hours old, 3d against 1h.
+            let held = |d: &Decision| matches!(d, Decision::Block { rule, .. } if rule == "min-release-age");
+            for (own, global) in [("3d", "1h"), ("1h", "3d")] {
+                let mut config =
+                    curation_toml(&format!("curation.{rt}.min_release_age"), own, "off");
+                config.curation.min_release_age = Some(global.to_string());
+                let (filter, problems) = MinReleaseAgeFilter::from_config(&config.curation);
+                assert!(problems.is_empty(), "{rt}: {problems:?}");
+                let filter = filter.unwrap();
+                assert_eq!(filter.summary(), format!("{global} ({rt}: {own})"));
+                for &other in RegistryType::all() {
+                    let decision = filter.evaluate(&age_request(other, Some(now - 2 * 3600)));
+                    let threshold = if other == rt { own } else { global };
+                    assert_eq!(
+                        held(&decision),
+                        threshold == "3d",
+                        "{rt} {own}, global {global}, {other} asked: {decision:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_summary_names_every_value_and_a_global_one_alone_keeps_its_old_line() {
+        use crate::curation::MinReleaseAgeFilter;
+        let _lock = env_lock();
+        let build = |global: Option<&str>, values: &[(&str, &str)]| {
+            let mut content = String::from("[curation]\n");
+            if let Some(g) = global {
+                content.push_str(&format!("min_release_age = \"{g}\"\n"));
+            }
+            for (rt, v) in values {
+                content.push_str(&format!("[curation.{rt}]\nmin_release_age = \"{v}\"\n"));
+            }
+            let (config, unknown) = parse_config(&content).unwrap();
+            assert!(unknown.is_empty(), "{content}: {unknown:?}");
+            let (filter, problems) = MinReleaseAgeFilter::from_config(&config.curation);
+            assert!(problems.is_empty(), "{problems:?}");
+            filter.unwrap()
+        };
+        let three = [("npm", "3d"), ("pypi", "2d"), ("gems", "1w")];
+        let f = build(None, &three);
+        assert_eq!(f.summary(), "npm: 3d, pypi: 2d, gems: 1w");
+        assert_eq!(f.global_only(), None);
+        let f = build(Some("7d"), &three);
+        assert_eq!(f.summary(), "7d (npm: 3d, pypi: 2d, gems: 1w)");
+        assert_eq!(f.global_only(), None);
+        let f = build(Some("7d"), &[]);
+        assert_eq!(f.summary(), "7d");
+        assert_eq!(f.global_only(), Some((7 * 86400, "7d")));
+    }
+
+    #[test]
+    fn an_unknown_publish_date_is_left_to_the_quarantine_whatever_value_applies() {
+        use crate::curation::{Decision, MinReleaseAgeFilter, ProxyFilter};
+        let _lock = env_lock();
+        // Without a date the filter has no opinion (the quarantine holds what is new),
+        // whether the threshold is npm's own, the global one, or both (#741, #1098).
+        for (global, npm) in [
+            (Some("3d"), None),
+            (None, Some("3d")),
+            (Some("3d"), Some("1h")),
+        ] {
+            let mut curation = CurationConfig::default();
+            curation.min_release_age = global.map(str::to_string);
+            curation.npm.min_release_age = npm.map(str::to_string);
+            let (filter, problems) = MinReleaseAgeFilter::from_config(&curation);
+            assert!(problems.is_empty(), "{problems:?}");
+            let filter = filter.unwrap();
+            for rt in [RegistryType::Npm, RegistryType::PyPI] {
+                assert_eq!(
+                    filter.evaluate(&age_request(rt, None)),
+                    Decision::Skip,
+                    "global {global:?}, npm {npm:?}: {rt}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_curation_enforce_missing_allowlist_file() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.curation.mode = CurationMode::Enforce;
+        config.curation.allowlist_path = Some("/nonexistent/allow.json".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors.iter().any(|e| e.contains("does not exist")),
+            "enforce with missing allowlist file should be an error"
+        );
+    }
+
+    /// Every curation duration key: global, then each `[curation.<registry>]` section.
+    /// Raw and Hugging Face have none.
+    fn curation_duration_keys() -> Vec<String> {
+        let mut keys = vec![
+            "curation.min_release_age".to_string(),
+            "curation.quarantine_ttl".to_string(),
+        ];
+        for rt in RegistryType::all() {
+            if !matches!(rt, RegistryType::Raw | RegistryType::HuggingFace) {
+                keys.push(format!("curation.{rt}.min_release_age"));
+                keys.push(format!("curation.{rt}.quarantine_ttl"));
+            }
+        }
+        keys
+    }
+
+    /// A config file setting `key` (a dotted curation key) to `value`, in `mode`.
+    fn curation_toml(key: &str, value: &str, mode: &str) -> Config {
+        let (table, field) = key.rsplit_once('.').unwrap();
+        let mut content = format!("[curation]\nmode = \"{mode}\"\n");
+        if table != "curation" {
+            content.push_str(&format!("[{table}]\n"));
+        }
+        content.push_str(&format!("{field} = \"{value}\"\n"));
+        let (config, unknown) = parse_config(&content).unwrap_or_else(|e| panic!("{e}\n{content}"));
+        assert!(unknown.is_empty(), "{content}: {unknown:?}");
+        config
+    }
+
+    /// `[curation.hf]` is no section of the config: reported as an unknown key, as
+    /// `[curation.raw]` is, not read as a minimum age that holds nothing.
+    #[test]
+    fn curation_hf_is_an_unknown_section() {
+        for table in ["curation.hf", "curation.raw"] {
+            let content = format!("[{table}]\nmin_release_age = \"7d\"\n");
+            let (_, unknown) = parse_config(&content).unwrap();
+            assert_eq!(unknown, vec![table.to_string()], "{content}");
+        }
+    }
+
+    #[test]
+    fn an_unparsable_curation_duration_is_a_config_error_naming_it() {
+        let _lock = env_lock();
+        // #1099: `quarantine_ttl = "30m"` became 14 days without a word, and an
+        // unparsable min_release_age stopped startup only in enforce mode.
+        for key in curation_duration_keys() {
+            for mode in ["off", "audit", "enforce"] {
+                let config = curation_toml(&key, "30m", mode);
+                let (_, errors) = config.validate_with_config_path(None);
+                let named = format!("{key}=\"30m\" is not a duration");
+                assert!(
+                    errors.iter().any(|e| e.contains(&named)),
+                    "{key} in {mode}: {errors:?}"
+                );
+            }
+        }
+    }
+
+    /// #1099: the validator accepts EXACTLY what the consumer's
+    /// `parse_duration` accepts — no normalization (case, trim, sign) the consumer
+    /// does not do, or a value the validator passes is silently taken as 14 days
+    /// by `digest_quarantine`/`docker`.
+    #[test]
+    fn the_duration_validator_accepts_exactly_what_the_consumer_parses() {
+        let _lock = env_lock();
+        for s in ["7d", "7D", " 2d", "2d ", "+2d", "30m", "1w2d", "0d", "２d"] {
+            let config = curation_toml("curation.quarantine_ttl", s, "off");
+            let (_, errors) = config.validate_with_config_path(None);
+            let flagged = errors.iter().any(|e| e.contains("curation.quarantine_ttl"));
+            let consumer_ok = crate::curation::parse_duration(s).is_ok();
+            assert_eq!(
+                flagged, !consumer_ok,
+                "validator flagged {s:?}={flagged}, but consumer parse_duration Ok={consumer_ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_curation_durations_are_not_errors() {
+        let _lock = env_lock();
+        for key in curation_duration_keys() {
+            for value in ["14d", "36h", "1w2d"] {
+                let config = curation_toml(&key, value, "audit");
+                let (_, errors) = config.validate_with_config_path(None);
+                let named = format!("{key}=\"{value}\" is not a duration");
+                assert!(
+                    !errors.iter().any(|e| e.contains(&named)),
+                    "{key}={value}: {errors:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_curation_audit_no_allowlist_warning() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.curation.mode = CurationMode::Audit;
+        let (warnings, errors) = config.validate_with_config_path(None);
+        assert!(errors.is_empty());
+        assert!(
+            warnings.iter().any(|w| w.contains("no allowlist_path")),
+            "audit without allowlist should be a warning"
+        );
+    }
+
+    #[test]
+    fn test_validate_curation_off_no_warnings() {
+        let _lock = env_lock();
+        let config = Config::default();
+        let (warnings, errors) = config.validate_with_config_path(None);
+        assert!(errors.is_empty());
+        assert!(
+            !warnings.iter().any(|w| w.contains("curation")),
+            "mode=off should produce no curation warnings"
+        );
+    }
+
+    #[test]
+    fn test_curation_mode_display() {
+        assert_eq!(CurationMode::Off.to_string(), "off");
+        assert_eq!(CurationMode::Audit.to_string(), "audit");
+        assert_eq!(CurationMode::Enforce.to_string(), "enforce");
+    }
+
+    // ========================================================================
+    // EnableSpec + [registries] tests
+    // ========================================================================
+
+    /// How many registries `all` switches on: every one except the opt-in ones.
+    fn in_all_count() -> usize {
+        RegistryType::all().iter().filter(|rt| rt.in_all()).count()
+    }
+
+    #[test]
+    fn test_enable_spec_single_all() {
+        let spec = EnableSpec::Single("all".to_string());
+        let set = spec.resolve().unwrap();
+        for rt in RegistryType::all() {
+            assert_eq!(set.contains(rt), rt.in_all(), "{:?}", rt);
+        }
+    }
+
+    /// `EnableSpec::resolve` is the one place `all`, inclusions, exclusions and aliases
+    /// meet: every combination an operator writes, with the set or the refusal it gives.
+    #[test]
+    fn test_enable_spec_resolve_table() {
+        let in_all: HashSet<RegistryType> = RegistryType::all()
+            .iter()
+            .copied()
+            .filter(|rt| rt.in_all())
+            .collect();
+        let plus = |extra: &[RegistryType]| -> HashSet<RegistryType> {
+            in_all.iter().chain(extra).copied().collect()
+        };
+        let minus = |gone: &[RegistryType]| -> HashSet<RegistryType> {
+            in_all
+                .iter()
+                .filter(|rt| !gone.contains(rt))
+                .copied()
+                .collect()
+        };
+        let set = |rts: &[RegistryType]| -> HashSet<RegistryType> { rts.iter().copied().collect() };
+        use RegistryType::{Docker, HuggingFace as Hf, Maven, Npm};
+        let ok: &[(&[&str], HashSet<RegistryType>)] = &[
+            (&["all"], in_all.clone()),
+            (&["all", "hf"], plus(&[Hf])),
+            (&["all", "huggingface"], plus(&[Hf])),
+            (&["all", "HF"], plus(&[Hf])),
+            (&["all", "-maven"], minus(&[Maven])),
+            (&["all", "-hf"], in_all.clone()),
+            (&["all", "hf", "-hf"], in_all.clone()),
+            (
+                &["all", "hf", "-maven"],
+                plus(&[Hf]).difference(&set(&[Maven])).copied().collect(),
+            ),
+            (&["hf"], set(&[Hf])),
+            (&["hf", "npm"], set(&[Hf, Npm])),
+            (&["docker"], set(&[Docker])),
+        ];
+        for (items, want) in ok {
+            let spec = EnableSpec::List(items.iter().map(|s| s.to_string()).collect());
+            assert_eq!(spec.resolve().as_ref(), Ok(want), "{items:?}");
+        }
+        let refused: &[(&[&str], &str)] = &[
+            (&["all", "docker"], "cannot be combined"),
+            (&["all", "dokcer"], "cannot be combined"),
+            (&["all", "hf", "dokcer"], "cannot be combined"),
+            (&["all", "hf", "npm"], "cannot be combined"),
+            (&["all", "-dokcer"], "unknown registry"),
+            (&["-hf"], "require \"all\""),
+            (&["dokcer"], "unknown registry"),
+            (&[], "must not be empty"),
+        ];
+        for (items, why) in refused {
+            let spec = EnableSpec::List(items.iter().map(|s| s.to_string()).collect());
+            let err = spec
+                .resolve()
+                .expect_err(&format!("{items:?} must be refused"));
+            assert!(err.contains(why), "{items:?}: {err}");
+        }
+    }
+
+    /// An opt-in format is never switched on by `all`: an operator who wrote `all` before
+    /// it existed did not opt in. It is named beside `all` to have both.
+    #[test]
+    fn test_all_leaves_out_opt_in_formats_until_named() {
+        assert!(!RegistryType::HuggingFace.in_all());
+        let all = EnableSpec::Single("all".to_string()).resolve().unwrap();
+        assert!(!all.contains(&RegistryType::HuggingFace));
+        let with_hf = EnableSpec::List(vec!["all".to_string(), "hf".to_string()])
+            .resolve()
+            .unwrap();
+        assert!(with_hf.contains(&RegistryType::HuggingFace));
+        assert_eq!(with_hf.len(), all.len() + 1);
+        // A format `all` already covers still cannot be named beside it.
+        let err = EnableSpec::List(vec!["all".to_string(), "docker".to_string()])
+            .resolve()
+            .unwrap_err();
+        assert!(err.contains("cannot be combined"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_enable_spec_single_registry() {
+        let spec = EnableSpec::Single("docker".to_string());
+        let set = spec.resolve().unwrap();
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&RegistryType::Docker));
+    }
+
+    #[test]
+    fn test_enable_spec_list_explicit() {
+        let spec = EnableSpec::List(vec![
+            "docker".to_string(),
+            "npm".to_string(),
+            "pypi".to_string(),
+        ]);
+        let set = spec.resolve().unwrap();
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&RegistryType::Docker));
+        assert!(set.contains(&RegistryType::Npm));
+        assert!(set.contains(&RegistryType::PyPI));
+    }
+
+    #[test]
+    fn test_enable_spec_all_minus() {
+        let spec = EnableSpec::List(vec!["all".to_string(), "-maven".to_string()]);
+        let set = spec.resolve().unwrap();
+        assert_eq!(set.len(), in_all_count() - 1);
+        assert!(!set.contains(&RegistryType::Maven));
+        assert!(set.contains(&RegistryType::Docker));
+    }
+
+    #[test]
+    fn test_enable_spec_all_minus_multiple() {
+        let spec = EnableSpec::List(vec![
+            "all".to_string(),
+            "-maven".to_string(),
+            "-conan".to_string(),
+        ]);
+        let set = spec.resolve().unwrap();
+        assert_eq!(set.len(), in_all_count() - 2);
+        assert!(!set.contains(&RegistryType::Maven));
+        assert!(!set.contains(&RegistryType::Conan));
+    }
+
+    #[test]
+    fn test_enable_spec_unknown_error() {
+        let spec = EnableSpec::Single("bogus".to_string());
+        assert!(spec.resolve().is_err());
+    }
+
+    #[test]
+    fn test_enable_spec_exclusion_without_all() {
+        let spec = EnableSpec::List(vec!["docker".to_string(), "-maven".to_string()]);
+        let err = spec.resolve().unwrap_err();
+        assert!(err.contains("require \"all\""), "got: {}", err);
+    }
+
+    #[test]
+    fn test_enable_spec_empty_error() {
+        let spec = EnableSpec::List(vec![]);
+        assert!(spec.resolve().is_err());
+    }
+
+    #[test]
+    fn test_enable_spec_aliases() {
+        let spec = EnableSpec::Single("rubygems".to_string());
+        let set = spec.resolve().unwrap();
+        assert!(set.contains(&RegistryType::Gems));
+
+        let spec2 = EnableSpec::Single("dart".to_string());
+        let set2 = spec2.resolve().unwrap();
+        assert!(set2.contains(&RegistryType::PubDart));
+
+        let spec3 = EnableSpec::Single("pub_dart".to_string());
+        let set3 = spec3.resolve().unwrap();
+        assert!(set3.contains(&RegistryType::PubDart));
+    }
+
+    #[test]
+    fn test_enable_spec_all_with_inclusions_error() {
+        let spec = EnableSpec::List(vec!["all".to_string(), "docker".to_string()]);
+        let err = spec.resolve().unwrap_err();
+        assert!(err.contains("cannot be combined"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_registries_toml_list() {
+        let _lock = env_lock();
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [registries]
+            enable = ["docker", "npm"]
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.registries.is_some());
+        let section = config.registries.as_ref().unwrap();
+        assert_eq!(
+            section.enable,
+            Some(EnableSpec::List(vec![
+                "docker".to_string(),
+                "npm".to_string()
+            ]))
+        );
+        let set = config.enabled_registries();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&RegistryType::Docker));
+        assert!(set.contains(&RegistryType::Npm));
+    }
+
+    #[test]
+    fn apply_enabled_registries_materializes_flags() {
+        // #856: the resolved enable-set must land in the per-registry `enabled`
+        // flags — hosted handlers (rpm/deb/raw) gate on those, not on the set.
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+        "#;
+        let mut config: Config = toml::from_str(toml).unwrap();
+        // rpm/deb default `enabled = false`; docker defaults `true`.
+        assert!(!config.rpm.enabled);
+        assert!(config.docker.enabled);
+
+        config.apply_enabled_registries(&std::collections::HashSet::from([RegistryType::Rpm]));
+
+        assert!(
+            config.rpm.enabled,
+            "rpm must be flagged enabled after apply (#856)"
+        );
+        assert!(!config.deb.enabled, "deb was not in the set");
+        assert!(
+            !config.docker.enabled,
+            "docker was not in the set — must be cleared"
+        );
+    }
+
+    #[test]
+    fn registries_toml_enable_backpropagates_to_flags() {
+        let _lock = env_lock();
+        // #856 at the config layer: `[registries].enable = ["rpm"]` resolves rpm
+        // into the set AND (after apply) into `config.rpm.enabled`, so the mounted
+        // rpm route no longer 404s in the handler gate.
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [registries]
+            enable = ["rpm"]
+        "#;
+        let mut config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.rpm.enabled, "precondition: rpm flag defaults off");
+
+        let set = config.enabled_registries();
+        config.apply_enabled_registries(&set);
+
+        assert!(set.contains(&RegistryType::Rpm));
+        assert!(
+            config.rpm.enabled,
+            "rpm flag must be set from [registries].enable (#856)"
+        );
+    }
+
+    #[test]
+    fn test_registries_toml_string() {
+        let _lock = env_lock();
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [registries]
+            enable = "all"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let set = config.enabled_registries();
+        let in_all = RegistryType::all().iter().filter(|rt| rt.in_all()).count();
+        assert_eq!(set.len(), in_all);
+    }
+
+    /// `enabled_registries_legacy` is a chain of `if` blocks, not a `match`: a format left
+    /// out of it is never enabled by its own `[x] enabled = true`, and nothing fails to
+    /// compile. Every flag switched on through the exhaustive `apply_enabled_registries`
+    /// has to come back as the full set.
+    #[test]
+    fn test_legacy_flags_cover_every_registry() {
+        let mut config = Config::default();
+        let all: HashSet<RegistryType> = RegistryType::all().iter().copied().collect();
+        config.apply_enabled_registries(&all);
+        assert_eq!(config.enabled_registries_legacy(), all);
+    }
+
+    /// Each `[x] enabled` flag switches on its own format and no other: a chain slot that
+    /// read a neighbour's flag would pass a test that switches every flag on at once.
+    #[test]
+    fn test_each_legacy_flag_enables_only_its_own_format() {
+        for rt in RegistryType::all() {
+            let mut config = Config::default();
+            let one: HashSet<RegistryType> = [*rt].into_iter().collect();
+            config.apply_enabled_registries(&one);
+            assert_eq!(config.enabled_registries_legacy(), one, "{:?}", rt);
+        }
+    }
+
+    #[test]
+    fn test_hf_enabled_only_by_true_or_one() {
+        let _lock = env_lock();
+        for (val, on) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("false", false),
+            ("0", false),
+            ("no", false),
+            ("off", false),
+            ("", false),
+        ] {
+            let mut config = Config::default();
+            config.hf.enabled = !on;
+            std::env::set_var("NORA_HF_ENABLED", val);
+            let applied = config.apply_env_overrides();
+            std::env::remove_var("NORA_HF_ENABLED");
+            applied.unwrap();
+            assert_eq!(config.hf.enabled, on, "NORA_HF_ENABLED={val:?}");
+        }
+    }
+
+    #[test]
+    fn test_hf_proxy_from_toml_is_the_upstream() {
+        let config: Config =
+            toml::from_str("[hf]\nenabled = true\nproxy = \"https://hf-mirror.example\"\n")
+                .unwrap();
+        assert_eq!(
+            config.hf.proxy.as_deref(),
+            Some("https://hf-mirror.example")
+        );
+        // An `[hf]` section that does not name a timeout keeps the default: zero would
+        // time out every request.
+        assert_eq!(config.hf.proxy_timeout, 30);
+        assert!(
+            !config
+                .upstream_hostnames()
+                .iter()
+                .any(|(reg, _)| reg == "hf"),
+            "hf bodies are not scanned for the upstream host"
+        );
+    }
+
+    /// The keys of `[hf]`, held by the compiler: destructured without `..`, so adding a
+    /// field — a credential among them — does not build until this line names it. The first
+    /// release proxies public repositories only.
+    #[test]
+    fn test_hf_config_keys_are_exactly_these() {
+        let HfConfig {
+            enabled: _,
+            proxy: _,
+            proxy_timeout: _,
+            // Host names a file redirect may go to, not a credential.
+            cdn_hosts: _,
+        } = HfConfig::default();
+    }
+
+    #[test]
+    fn hf_cdn_hosts_come_from_the_env_and_a_malformed_one_is_refused() {
+        let _lock = env_lock();
+        assert_eq!(
+            HfConfig::default().cdn_hosts,
+            vec!["hf.co", "huggingface.co"]
+        );
+        // Trimmed and lowercased, a blank item dropped wherever it is.
+        std::env::set_var("NORA_HF_CDN_HOSTS", " CDN.Example.com, ,10.0.0.5 ,");
+        let mut config = Config::default();
+        config.hf.apply_env_overrides();
+        std::env::remove_var("NORA_HF_CDN_HOSTS");
+        assert_eq!(config.hf.cdn_hosts, vec!["cdn.example.com", "10.0.0.5"]);
+        assert!(config.hf.invalid_cdn_hosts().is_empty());
+        for good in [
+            "cdn-lfs.example",
+            "x1.hf.co",
+            "hf.co",
+            "127.0.0.1",
+            "::1",
+            "0:0:0:0:0:0:0:1",
+        ] {
+            let mut config = Config::default();
+            config.hf.cdn_hosts = vec![good.to_string()];
+            assert!(config.hf.invalid_cdn_hosts().is_empty(), "{good:?}");
+        }
+        // A TOML entry is taken as written: a capital letter would match no host, a trailing
+        // dot neither, so both are errors rather than entries that silently hold nothing.
+        for bad in [
+            "https://cdn.example.com",
+            "cdn.example.com:443",
+            "cdn.example.com/x",
+            "*.hf.co",
+            ".hf.co",
+            "hf.co.",
+            "HF.co",
+            "[::1]",
+            "cdn example.com",
+            "",
+        ] {
+            let mut config = Config::default();
+            config.hf.cdn_hosts = vec![bad.to_string()];
+            let (_, errors) = config.validate_with_config_path(None);
+            assert!(
+                errors.iter().any(|e| e.contains("hf.cdn_hosts entry")),
+                "{bad:?}: {errors:?}"
+            );
+        }
+        let (_, errors) = Config::default().validate_with_config_path(None);
+        assert!(
+            !errors.iter().any(|e| e.contains("hf.cdn_hosts")),
+            "{errors:?}"
+        );
+    }
+
+    /// A Hub commit has no publish date NORA reads and hf has no quarantine path, so a
+    /// min_release_age would hold nothing there: refused, not ignored.
+    #[test]
+    fn test_min_release_age_is_refused_with_hf() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.curation.min_release_age = Some("7d".to_string());
+        config.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors.iter().any(|e| e.contains("Hugging Face")),
+            "{errors:?}"
+        );
+        config.hf.enabled = true;
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors.iter().any(|e| e.contains("Hugging Face")),
+            "{errors:?}"
+        );
+        config.curation.min_release_age = None;
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors.iter().any(|e| e.contains("Hugging Face")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_hf_enabled_from_toml_and_env() {
+        let _lock = env_lock();
+        let config: Config = toml::from_str("[hf]\nenabled = true\n").unwrap();
+        assert!(config
+            .enabled_registries()
+            .contains(&RegistryType::HuggingFace));
+        assert_eq!(config.hf.proxy.as_deref(), Some("https://huggingface.co"));
+
+        let mut config = Config::default();
+        std::env::set_var("NORA_HF_ENABLED", "true");
+        std::env::set_var("NORA_HF_PROXY", "http://127.0.0.1:9");
+        std::env::set_var("NORA_HF_PROXY_TIMEOUT", "7");
+        let applied = config.apply_env_overrides();
+        std::env::remove_var("NORA_HF_ENABLED");
+        std::env::remove_var("NORA_HF_PROXY");
+        std::env::remove_var("NORA_HF_PROXY_TIMEOUT");
+        applied.unwrap();
+        assert!(config.hf.enabled);
+        assert_eq!(config.hf.proxy.as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(config.hf.proxy_timeout, 7);
+    }
+
+    /// The first release proxies public repositories only: a server-side Hub token would let
+    /// the cache hand gated repositories to every NORA user. Until that is decided otherwise,
+    /// `[hf]` has no credential key, and a file that sets one is told so.
+    #[test]
+    fn test_hf_has_no_server_side_token() {
+        let (_, unknown) =
+            parse_config("[hf]\nenabled = true\nproxy_auth = \"user:token\"\n").unwrap();
+        assert_eq!(unknown, vec!["hf.proxy_auth".to_string()]);
+    }
+
+    #[test]
+    fn test_registries_toml_absent() {
+        let _lock = env_lock();
+        // No [registries] section → legacy mode
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.registries.is_none());
+        // Legacy: 7 core enabled by default
+        let set = config.enabled_registries();
+        assert_eq!(set.len(), 7);
+        assert!(set.contains(&RegistryType::Docker));
+        assert!(set.contains(&RegistryType::Maven));
+        assert!(!set.contains(&RegistryType::Gems)); // new registries default disabled
+    }
+
+    #[test]
+    fn test_registries_toml_empty_section() {
+        let _lock = env_lock();
+        // [registries] without enable → legacy mode
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [registries]
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.registries.is_some());
+        assert!(config.registries.as_ref().unwrap().enable.is_none());
+        // Falls through to legacy
+        let set = config.enabled_registries();
+        assert_eq!(set.len(), 7);
+    }
+
+    #[test]
+    fn test_env_overrides_toml_registries() {
+        let _lock = env_lock();
+        // NORA_REGISTRIES_ENABLE should take precedence over [registries].enable
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [registries]
+            enable = ["docker", "npm"]
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        std::env::set_var("NORA_REGISTRIES_ENABLE", "cargo,pypi");
+        let set = config.enabled_registries();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&RegistryType::Cargo));
+        assert!(set.contains(&RegistryType::PyPI));
+        assert!(!set.contains(&RegistryType::Docker));
+        std::env::remove_var("NORA_REGISTRIES_ENABLE");
+    }
+
+    #[test]
+    fn test_from_env_str_parsing() {
+        let spec = EnableSpec::from_env_str("docker, npm , pypi");
+        assert_eq!(
+            spec,
+            EnableSpec::List(vec![
+                "docker".to_string(),
+                "npm".to_string(),
+                "pypi".to_string()
+            ])
+        );
+
+        // Single value
+        let spec2 = EnableSpec::from_env_str("all");
+        assert_eq!(spec2, EnableSpec::Single("all".to_string()));
+
+        // Uppercase → lowercase
+        let spec3 = EnableSpec::from_env_str("Docker,NPM");
+        assert_eq!(
+            spec3,
+            EnableSpec::List(vec!["docker".to_string(), "npm".to_string()])
+        );
+
+        // With exclusions
+        let spec4 = EnableSpec::from_env_str("all,-maven,-conan");
+        assert_eq!(
+            spec4,
+            EnableSpec::List(vec![
+                "all".to_string(),
+                "-maven".to_string(),
+                "-conan".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_validate_unknown_registry_in_enable() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.registries = Some(RegistriesSection {
+            enable: Some(EnableSpec::List(vec![
+                "docker".to_string(),
+                "bogus".to_string(),
+            ])),
+        });
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors.iter().any(|e| e.contains("[registries].enable")),
+            "should report validation error: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_registries_toml_all_minus() {
+        let _lock = env_lock();
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            mode = "local"
+
+            [registries]
+            enable = ["all", "-maven", "-conan"]
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let set = config.enabled_registries();
+        assert_eq!(set.len(), in_all_count() - 2);
+        assert!(!set.contains(&RegistryType::Maven));
+        assert!(!set.contains(&RegistryType::Conan));
+        assert!(set.contains(&RegistryType::Docker));
+    }
+
+    #[test]
+    fn test_upstream_hostnames_extracts_from_defaults() {
+        let config = Config::default();
+        let hosts = config.upstream_hostnames();
+        // Default config has proxy URLs for several registries
+        let hostnames: Vec<&str> = hosts.iter().map(|(_, h)| h.as_str()).collect();
+        assert!(hostnames.contains(&"crates.io"), "cargo default missing");
+        assert!(
+            hostnames.contains(&"api.nuget.org"),
+            "nuget default missing"
+        );
+        assert!(
+            hostnames.contains(&"azuresearch-usnc.nuget.org"),
+            "nuget search default missing"
+        );
+        assert!(
+            hostnames.contains(&"proxy.golang.org"),
+            "go default missing"
+        );
+        // Hugging Face metadata carries the Hub's host as content (a model card's
+        // `license_link`), and its proxy URLs travel in headers, not bodies.
+        assert!(
+            !hostnames.contains(&"huggingface.co"),
+            "hf bodies are not scanned for the upstream host"
+        );
+        // localhost should be excluded
+        assert!(!hostnames.contains(&"localhost"));
+        assert!(!hostnames.contains(&"127.0.0.1"));
+    }
+
+    #[test]
+    fn test_upstream_hostnames_deduplicates() {
+        let config = Config::default();
+        let hosts = config.upstream_hostnames();
+        let mut seen = std::collections::HashSet::new();
+        for pair in &hosts {
+            assert!(seen.insert(pair), "duplicate: {:?}", pair);
+        }
+    }
+
+    #[test]
+    fn test_upstream_hostnames_docker_upstreams() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            path = "/tmp/nora-test"
+
+            [docker]
+            enabled = true
+
+            [[docker.upstreams]]
+            url = "https://registry-1.docker.io"
+
+            [[docker.upstreams]]
+            url = "https://ghcr.io"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let hosts = config.upstream_hostnames();
+        let docker_hosts: Vec<&str> = hosts
+            .iter()
+            .filter(|(r, _)| r == "docker")
+            .map(|(_, h)| h.as_str())
+            .collect();
+        assert!(docker_hosts.contains(&"registry-1.docker.io"));
+        assert!(docker_hosts.contains(&"ghcr.io"));
+    }
+
+    #[test]
+    fn test_upstream_hostnames_pypi_multi_upstream() {
+        // #663: every configured pypi upstream host must reach the leak detector,
+        // not just the legacy single `proxy`. A secondary upstream (e.g. an internal
+        // mirror carrying credentials) was previously invisible to leak scanning.
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 4000
+
+            [storage]
+            path = "/tmp/nora-test"
+
+            [[pypi.proxies]]
+            url = "https://pypi.org/simple"
+
+            [[pypi.proxies]]
+            url = "https://internal-nexus.corp/pypi"
+            auth = "secret-token"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let hosts = config.upstream_hostnames();
+        let pypi_hosts: Vec<&str> = hosts
+            .iter()
+            .filter(|(r, _)| r == "pypi")
+            .map(|(_, h)| h.as_str())
+            .collect();
+        assert!(
+            pypi_hosts.contains(&"pypi.org"),
+            "primary upstream registered"
+        );
+        assert!(
+            pypi_hosts.contains(&"internal-nexus.corp"),
+            "secondary upstream host must be registered with the leak detector"
+        );
+    }
+
+    #[test]
+    fn test_storage_config_debug_redacts_credentials() {
+        let config = StorageConfig {
+            mode: StorageMode::Local,
+            path: String::new(),
+            s3_url: String::new(),
+            bucket: String::new(),
+            s3_access_key: Some(ProtectedString::from("AKIAIOSFODNN7EXAMPLE")),
+            s3_secret_key: Some(ProtectedString::from(
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            )),
+            s3_region: String::new(),
+            s3_virtual_hosted: false,
+            gcs_service_account_path: None,
+            gcs_base_url: None,
+        };
+        let debug_output = format!("{:?}", config);
+        assert!(
+            !debug_output.contains("AKIAIOSFODNN7EXAMPLE"),
+            "Debug output must not contain access key"
+        );
+        assert!(
+            !debug_output.contains("wJalrXUtnFEMI"),
+            "Debug output must not contain secret key"
+        );
+        assert!(
+            debug_output.contains("REDACTED"),
+            "Debug output should show REDACTED for credential fields"
+        );
+    }
+
+    // ========================================================================
+    // Wildcard host + public_url validation (#510)
+    // ========================================================================
+
+    #[test]
+    fn test_validate_wildcard_host_requires_public_url() {
+        let _lock = env_lock();
+        for host in &["0.0.0.0", "::", "0:0:0:0:0:0:0:0"] {
+            let mut config = Config::default();
+            config.server.host = host.to_string();
+            config.server.public_url = None;
+            let (_, errors) = config.validate_with_config_path(None);
+            assert!(
+                errors.iter().any(|e| e.contains("NORA_PUBLIC_URL")),
+                "host='{}' without public_url should produce NORA_PUBLIC_URL error, got: {:?}",
+                host,
+                errors
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_wildcard_host_with_public_url_ok() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.server.host = "0.0.0.0".to_string();
+        config.server.public_url = Some("http://registry.example.com:4000".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            !errors.iter().any(|e| e.contains("NORA_PUBLIC_URL")),
+            "0.0.0.0 with valid public_url should not error: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_validate_non_wildcard_host_no_public_url_ok() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.server.host = "192.168.1.10".to_string();
+        config.server.public_url = None;
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors.is_empty(),
+            "non-wildcard host without public_url should have no errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_validate_public_url_rejects_bad_scheme() {
+        let _lock = env_lock();
+        for scheme_url in &["ftp://registry.example.com", "javascript://alert(1)"] {
+            let mut config = Config::default();
+            config.server.public_url = Some(scheme_url.to_string());
+            let (_, errors) = config.validate_with_config_path(None);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("http://") || e.contains("https://")),
+                "public_url='{}' should be rejected for bad scheme: {:?}",
+                scheme_url,
+                errors
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_public_url_rejects_garbage() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.server.public_url = Some("not-a-url".to_string());
+        let (_, errors) = config.validate_with_config_path(None);
+        assert!(
+            errors.iter().any(|e| e.contains("not a valid URL")),
+            "garbage public_url should produce validation error: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_validate_public_url_accepts_valid() {
+        let _lock = env_lock();
+        for url in &[
+            "http://registry:4000",
+            "https://nora.example.com",
+            "http://10.0.0.1:4000",
+            "https://nora.example.com:8443/",
+        ] {
+            let mut config = Config::default();
+            config.server.public_url = Some(url.to_string());
+            let (_, errors) = config.validate_with_config_path(None);
+            assert!(
+                !errors.iter().any(|e| e.contains("NORA_PUBLIC_URL")),
+                "valid public_url='{}' should not produce errors: {:?}",
+                url,
+                errors
+            );
+        }
+    }
+
+    // --- TrustedProxies: prefix=0 overflow fix (#525) ---
+
+    #[test]
+    fn test_trusted_proxies_prefix_zero_v4() {
+        let proxies = TrustedProxies::parse("0.0.0.0/0");
+        assert!(proxies.contains("192.168.1.1".parse().unwrap()));
+        assert!(proxies.contains("10.0.0.1".parse().unwrap()));
+        assert!(proxies.contains("255.255.255.255".parse().unwrap()));
+        assert!(proxies.contains("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_prefix_zero_v6() {
+        let proxies = TrustedProxies::parse("::/0");
+        assert!(proxies.contains("::1".parse().unwrap()));
+        assert!(proxies.contains("fe80::1".parse().unwrap()));
+        assert!(proxies.contains("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_prefix_zero_no_cross_family() {
+        // 0.0.0.0/0 must NOT match IPv6 addresses
+        let v4_all = TrustedProxies::parse("0.0.0.0/0");
+        assert!(!v4_all.contains("::1".parse().unwrap()));
+        assert!(!v4_all.contains("2001:db8::1".parse().unwrap()));
+
+        // ::/0 must NOT match IPv4 addresses
+        let v6_all = TrustedProxies::parse("::/0");
+        assert!(!v6_all.contains("127.0.0.1".parse().unwrap()));
+        assert!(!v6_all.contains("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_prefix_zero_non_canonical_network() {
+        // Non-zero network address with /0 still matches everything in that family
+        let proxies = TrustedProxies::parse("192.168.1.1/0");
+        assert!(proxies.contains("10.0.0.1".parse().unwrap()));
+        assert!(proxies.contains("172.16.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_prefix_zero_parse_accepted() {
+        // /0 must not be dropped by parse()
+        let proxies = TrustedProxies::parse("0.0.0.0/0");
+        assert!(proxies.has_prefix_zero());
+
+        let proxies = TrustedProxies::parse("::/0");
+        assert!(proxies.has_prefix_zero());
+
+        // Normal CIDR must not trigger has_prefix_zero
+        let proxies = TrustedProxies::parse("10.0.0.0/8");
+        assert!(!proxies.has_prefix_zero());
+    }
+
+    #[test]
+    fn test_trusted_proxies_existing_behavior_unchanged() {
+        // Verify existing prefix values still work correctly
+        let proxies = TrustedProxies::parse("10.0.0.0/8");
+        assert!(proxies.contains("10.255.255.255".parse().unwrap()));
+        assert!(!proxies.contains("11.0.0.1".parse().unwrap()));
+
+        let proxies = TrustedProxies::parse("192.168.1.0/24");
+        assert!(proxies.contains("192.168.1.100".parse().unwrap()));
+        assert!(!proxies.contains("192.168.2.1".parse().unwrap()));
+
+        // Exact match (no CIDR)
+        let proxies = TrustedProxies::parse("10.0.0.1");
+        assert!(proxies.contains("10.0.0.1".parse().unwrap()));
+        assert!(!proxies.contains("10.0.0.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_validate_warns_on_prefix_zero() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.auth.trusted_proxies = TrustedProxies::parse("0.0.0.0/0");
+        let (warnings, _) = config.validate_with_config_path(None);
+        assert!(
+            warnings.iter().any(|w| w.contains("/0 CIDR")),
+            "validate() should warn about /0 in trusted_proxies: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_validate_no_warn_on_normal_proxies() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.auth.trusted_proxies = TrustedProxies::parse("10.0.0.0/8,192.168.1.0/24");
+        let (warnings, _) = config.validate_with_config_path(None);
+        assert!(
+            !warnings.iter().any(|w| w.contains("/0 CIDR")),
+            "validate() should not warn about normal CIDRs: {:?}",
+            warnings
+        );
+    }
+
+    mod proptest_trusted_proxies {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Reference implementation for CIDR matching (avoids the shift overflow).
+        fn cidr_matches_reference(net: u32, addr: u32, prefix: u8) -> bool {
+            if prefix == 0 {
+                return true;
+            }
+            if prefix >= 32 {
+                return net == addr;
+            }
+            // Right-shift is safe for prefix 1..=31
+            (net >> (32 - prefix)) == (addr >> (32 - prefix))
+        }
+
+        fn cidr_matches_reference_v6(net: u128, addr: u128, prefix: u8) -> bool {
+            if prefix == 0 {
+                return true;
+            }
+            if prefix >= 128 {
+                return net == addr;
+            }
+            (net >> (128 - prefix)) == (addr >> (128 - prefix))
+        }
+
+        proptest! {
+            #[test]
+            fn cidr_v4_matches_oracle(
+                net_raw in any::<u32>(),
+                addr_raw in any::<u32>(),
+                prefix in 0u8..=32,
+            ) {
+                let net = std::net::Ipv4Addr::from(net_raw);
+                let addr = std::net::Ipv4Addr::from(addr_raw);
+                let cidr = format!("{}/{}", net, prefix);
+                let proxies = TrustedProxies::parse(&cidr);
+                let actual = proxies.contains(std::net::IpAddr::V4(addr));
+                let expected = cidr_matches_reference(net_raw, addr_raw, prefix);
+                prop_assert_eq!(actual, expected,
+                    "CIDR {} vs addr {}: expected={}, actual={}",
+                    cidr, addr, expected, actual);
+            }
+
+            #[test]
+            fn cidr_v6_matches_oracle(
+                net_raw in any::<u128>(),
+                addr_raw in any::<u128>(),
+                prefix in 0u8..=128,
+            ) {
+                let net = std::net::Ipv6Addr::from(net_raw);
+                let addr = std::net::Ipv6Addr::from(addr_raw);
+                let cidr = format!("{}/{}", net, prefix);
+                let proxies = TrustedProxies::parse(&cidr);
+                let actual = proxies.contains(std::net::IpAddr::V6(addr));
+                let expected = cidr_matches_reference_v6(net_raw, addr_raw, prefix);
+                prop_assert_eq!(actual, expected,
+                    "CIDR {} vs addr {}: expected={}, actual={}",
+                    cidr, addr, expected, actual);
+            }
+        }
+    }
+}

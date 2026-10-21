@@ -1,0 +1,26 @@
+[default.extend-words]
+# HashiCorp is not a typo
+Hashi = "Hashi"
+# flate2 is a Rust crate for compression
+flate = "flate"
+# grep pattern fragments in lint scripts
+validat = "validat"
+registr = "registr"
+# base64-encoded RSA key data in OIDC test constants
+NLY = "NLY"
+# intentional typo in test_audit_mode_rejects_invalid (audit.rs)
+flie = "flie"
+# "unparseable" is a valid English spelling (alongside "unparsable")
+unparseable = "unparseable"
+# intentional typos: unknown config keys in config tests and the changelog example
+mdoe = "mdoe"
+enabeld = "enabeld"
+unknwon = "unknwon"
+# intentional typo: an unknown registry name next to a real one in the enable-list tests (config/mod.rs)
+dokcer = "dokcer"
+
+[files]
+# nora-registry/src/ui/static/swagger-ui/: Swagger UI release files, minified, kept byte for byte (pinned in openapi.rs).
+# nora-registry/testdata/**/*.tsv: corpora written by the formats' own tools (each file names the
+# script that regenerates it); their names and versions are data (`Crypt-SecurID`, fuzzed inputs).
+extend-exclude = ["vendor/", "*.lock", "target/", "fuzz/corpus/", "nora-registry/src/ui/static/*.js", "nora-registry/src/ui/static/swagger-ui/*.js", "nora-registry/src/ui/static/swagger-ui/*.css", "nora-registry/testdata/**/*.tsv"]
