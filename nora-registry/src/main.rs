@@ -63,6 +63,7 @@ mod retention;
 mod secrets;
 mod signing;
 mod storage;
+mod storage_watch;
 mod tokens;
 mod ui;
 mod validation;
@@ -386,6 +387,9 @@ pub struct AppState {
     pub audit: Arc<AuditLog>,
     pub docker_auth: Arc<registry::DockerAuth>,
     pub repo_index: Arc<RepoIndex>,
+    /// Broadcast bus for repository-change events; drives the web UI's
+    /// real-time refresh (SSE on `/api/ui/events`).
+    pub ui_events: Arc<ui::UiEventBus>,
     pub http_client: reqwest::Client,
     /// The same client, except that it never follows a redirect: for a format whose answer
     /// depends on what each hop said (hf: the commit rides on the Hub's redirect).
@@ -2413,6 +2417,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let signer = build_signer(&config, &enabled_registries);
 
+    let ui_events = Arc::new(ui::UiEventBus::new());
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -2426,6 +2431,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
+        ui_events,
         http_client,
         http_client_no_redirect,
         hf_canonical_ids: Arc::default(),
@@ -2564,6 +2570,44 @@ async fn run_server(mut config: Config, storage: Storage) {
             cleanup_lock,
             cancel_token.clone(),
         ));
+    }
+
+    // Out-of-band storage watcher: detects deb/rpm/raw files changed outside
+    // the registry APIs (drops into the data directory), reconciles the
+    // affected repositories (rebuilds `Packages` / `repodata`), invalidates
+    // every registry index and broadcasts a real-time UI refresh event so
+    // open dashboard / repository-list pages update without a reload.
+    // Local storage only: a full LIST per tick on an object store would be
+    // expensive, and "out-of-band files" is a filesystem concept.
+    if state.config.watch.enabled && state.config.storage.mode == config::StorageMode::Local {
+        let storage = state.storage.clone();
+        let repo_index = Arc::clone(&state.repo_index);
+        let signer = state.signer.clone();
+        let enabled_registries = Arc::clone(&state.enabled_registries);
+        let publish_locks = state.publish_locks.clone();
+        let ui_events = Arc::clone(&state.ui_events);
+        let cfg = state.config.watch.clone();
+        let rpm_changelog_limit = state.config.rpm.changelog_limit;
+        scheduler_handles.push(tokio::spawn(storage_watch::run_storage_watch(
+            storage,
+            repo_index,
+            signer,
+            enabled_registries,
+            publish_locks,
+            ui_events,
+            cfg,
+            rpm_changelog_limit,
+            cancel_token.clone(),
+        )));
+        info!(
+            interval_secs = state.config.watch.interval_secs,
+            settle_secs = state.config.watch.settle_secs,
+            "Out-of-band storage watcher scheduled"
+        );
+    } else if !state.config.watch.enabled {
+        info!("Out-of-band storage watcher disabled by config");
+    } else {
+        info!("Out-of-band storage watcher skipped (non-local storage backend)");
     }
 
     let app = Router::new()
@@ -2891,6 +2935,7 @@ async fn shutdown_signal() {
 /// Re-reads config.toml, rebuilds the CurationEngine with new filters,
 /// and atomically swaps the old config via ArcSwap.
 /// Storage, auth, port, and other settings are NOT reloaded — only curation.
+#[allow(dead_code)]
 fn reload_curation(state: &AppState) -> Result<(), String> {
     let config = Config::try_load()?;
 

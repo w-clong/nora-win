@@ -283,6 +283,7 @@ fn build_context_full(
         },
         registries: None,
         signing: crate::config::SigningConfig::default(),
+        watch: crate::config::WatchConfig::default(),
     };
 
     // Apply any custom config tweaks
@@ -386,6 +387,7 @@ fn build_context_full(
         audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
+        ui_events: Arc::new(crate::ui::UiEventBus::new()),
         http_client,
         http_client_no_redirect,
         hf_canonical_ids: Arc::default(),

@@ -90,6 +90,7 @@ pub fn layout_dark_filtered(
         </div>
     </div>
 
+    {}
     <script>
         function toggleSidebar() {{
             const sidebar = document.getElementById('sidebar');
@@ -120,6 +121,7 @@ pub fn layout_dark_filtered(
         sidebar_dark_with_registries(active_page, t, auth_enabled, enabled_registries),
         header_dark(lang),
         content,
+        render_realtime_refresh_script(),
         extra_scripts
     )
 }
@@ -721,43 +723,46 @@ pub fn render_activity_log(rows: &str, t: &Translations) -> String {
 
 /// Render the polling script for auto-refresh.
 ///
-/// The live uptime recomputed here every 5s must agree with [`format_uptime`],
-/// so the day/hour/minute units are the same localized strings from `t` and the
+/// Defines `window.applyDashboard(data)` — shared with the real-time refresh
+/// script — and polls `/api/ui/dashboard` every 5s as a drift fallback (the
+/// SSE event stream triggers the same updater immediately on storage changes).
+///
+/// The uptime recomputed here every 5s must agree with [`format_uptime`], so the
+/// day/hour/minute units are the same localized strings from `t` and the
 /// arithmetic (the 86400/3600/60 split and the `days > 0` conditional) is kept in
 /// lockstep with it.
 pub fn render_polling_script(t: &Translations) -> String {
     r##"
     <script>
+        window.applyDashboard = function (data) {
+            if (!data || !data.global_stats) return;
+            document.getElementById('stat-downloads').textContent = data.global_stats.downloads;
+            document.getElementById('stat-uploads').textContent = data.global_stats.uploads;
+            document.getElementById('stat-artifacts').textContent = data.global_stats.artifacts;
+            document.getElementById('stat-cache-hit').textContent = data.global_stats.cache_hit_percent.toFixed(1) + '%';
+
+            const bytes = data.global_stats.storage_bytes;
+            let sizeStr;
+            if (bytes >= 1073741824) sizeStr = (bytes / 1073741824).toFixed(1) + ' GB';
+            else if (bytes >= 1048576) sizeStr = (bytes / 1048576).toFixed(1) + ' MB';
+            else if (bytes >= 1024) sizeStr = (bytes / 1024).toFixed(1) + ' KB';
+            else sizeStr = bytes + ' B';
+            document.getElementById('stat-storage').textContent = sizeStr;
+
+            const uptime = document.getElementById('uptime');
+            if (uptime) {
+                const secs = data.uptime_seconds;
+                const days = Math.floor(secs / 86400);
+                const hours = Math.floor((secs % 86400) / 3600);
+                const mins = Math.floor((secs % 3600) / 60);
+                uptime.textContent =
+                    (days > 0 ? days + '__UPTIME_D__ ' : '') + hours + '__UPTIME_H__ ' + mins + '__UPTIME_M__';
+            }
+        };
         setInterval(async () => {
             try {
                 const data = await fetch('/api/ui/dashboard').then(r => r.json());
-
-                // Update global stats
-                document.getElementById('stat-downloads').textContent = data.global_stats.downloads;
-                document.getElementById('stat-uploads').textContent = data.global_stats.uploads;
-                document.getElementById('stat-artifacts').textContent = data.global_stats.artifacts;
-                document.getElementById('stat-cache-hit').textContent = data.global_stats.cache_hit_percent.toFixed(1) + '%';
-
-                // Format storage size
-                const bytes = data.global_stats.storage_bytes;
-                let sizeStr;
-                if (bytes >= 1073741824) sizeStr = (bytes / 1073741824).toFixed(1) + ' GB';
-                else if (bytes >= 1048576) sizeStr = (bytes / 1048576).toFixed(1) + ' MB';
-                else if (bytes >= 1024) sizeStr = (bytes / 1024).toFixed(1) + ' KB';
-                else sizeStr = bytes + ' B';
-                document.getElementById('stat-storage').textContent = sizeStr;
-
-                // Update uptime (days/hours/minutes; the day part appears only when
-                // there is one, matching the server-rendered value)
-                const uptime = document.getElementById('uptime');
-                if (uptime) {
-                    const secs = data.uptime_seconds;
-                    const days = Math.floor(secs / 86400);
-                    const hours = Math.floor((secs % 86400) / 3600);
-                    const mins = Math.floor((secs % 3600) / 60);
-                    uptime.textContent =
-                        (days > 0 ? days + '__UPTIME_D__ ' : '') + hours + '__UPTIME_H__ ' + mins + '__UPTIME_M__';
-                }
+                window.applyDashboard(data);
             } catch (e) {
                 console.error('Dashboard poll failed:', e);
             }
@@ -767,6 +772,60 @@ pub fn render_polling_script(t: &Translations) -> String {
     .replace("__UPTIME_D__", t.uptime_days)
     .replace("__UPTIME_H__", t.uptime_hours)
     .replace("__UPTIME_M__", t.uptime_mins)
+}
+
+/// Real-time refresh driver, injected into every page's layout.
+///
+/// Opens an EventSource on `/api/ui/events`; whenever the server broadcasts a
+/// `reindex` event (out-of-band storage change detected, deb/rpm indexes
+/// rebuilt), the current page refreshes itself in place:
+/// - repository list pages re-fetch the page and swap `#repo-table-body`;
+/// - the dashboard re-applies the dashboard JSON (stats) and swaps the
+///   `#registry-cards` grid from the `/api/ui/dashboard/cards` fragment.
+///
+/// EventSource auto-reconnects, so no manual retry logic is needed.
+pub fn render_realtime_refresh_script() -> String {
+    r##"
+    <script>
+    (function () {
+        function refreshPageData() {
+            var body = document.getElementById('repo-table-body');
+            if (body) {
+                fetch(location.pathname + location.search)
+                    .then(function (r) { return r.text(); })
+                    .then(function (html) {
+                        var doc = new DOMParser().parseFromString(html, 'text/html');
+                        var fresh = doc.getElementById('repo-table-body');
+                        if (fresh) body.replaceWith(fresh);
+                    })
+                    .catch(function () {});
+                return;
+            }
+            if (document.getElementById('stat-artifacts')) {
+                fetch('/api/ui/dashboard')
+                    .then(function (r) { return r.json(); })
+                    .then(function (data) {
+                        if (window.applyDashboard) window.applyDashboard(data);
+                    })
+                    .catch(function () {});
+                var langMatch = document.cookie.match(/nora_lang=([^;]+)/);
+                var langQuery = langMatch ? ('?lang=' + encodeURIComponent(langMatch[1])) : '';
+                fetch('/api/ui/dashboard/cards' + langQuery)
+                    .then(function (r) { return r.text(); })
+                    .then(function (html) {
+                        var grid = document.getElementById('registry-cards');
+                        if (grid && html) grid.outerHTML = html;
+                    })
+                    .catch(function () {});
+            }
+        }
+        try {
+            var es = new EventSource('/api/ui/events');
+            es.addEventListener('reindex', refreshPageData);
+        } catch (e) {}
+    })();
+    </script>
+    "##.to_string()
 }
 
 /// SVG icon definitions for registries (exported for use in templates)
