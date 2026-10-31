@@ -70,7 +70,7 @@ const AUX_DIR: &str = ".nora-aux";
 const REPODATA: &str = "repodata";
 
 /// Auxiliary metadata NORA can merge into a hosted repo's repomd.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AuxKind {
     /// `modules.yaml` — Fedora/RHEL module streams (PHP, nodejs, ...).
     Modules,
@@ -172,6 +172,269 @@ fn aux_kind_for_key(key: &str) -> Option<AuxKind> {
     AuxKind::ALL
         .into_iter()
         .find(|kind| kind.filename() == name)
+}
+
+// ============================================================================
+// Adoption of metadata copied into `repodata/` by an external sync
+// ============================================================================
+
+/// Upper bound for a decompressed adopted document. Upstream modules.yaml is a
+/// few MB; the cap stops a corrupted or hostile sync from exhausting memory.
+const ADOPT_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// repomd `<data type=…>` names carrying auxiliary metadata. `group`/`group_gz`
+/// are both comps documents (createrepo_c writes one or the other).
+fn aux_kind_for_repomd_type(ty: &str) -> Option<AuxKind> {
+    match ty {
+        "modules" => Some(AuxKind::Modules),
+        "group" | "group_gz" => Some(AuxKind::Comps),
+        "updateinfo" => Some(AuxKind::Updateinfo),
+        _ => None,
+    }
+}
+
+/// `(kind, href)` pairs from a repomd. Both createrepo_c and NORA write
+/// `<data type="…">` as the first attribute; the scan is deliberately tiny
+/// rather than pulling in an XML parser (as the mirror does).
+fn repomd_aux_locations(repomd: &str) -> Vec<(AuxKind, String)> {
+    let mut out = Vec::new();
+    for entry in repomd.split("<data type=\"").skip(1) {
+        let Some(type_end) = entry.find('"') else {
+            continue;
+        };
+        let Some(kind) = aux_kind_for_repomd_type(&entry[..type_end]) else {
+            continue;
+        };
+        let body_end = entry.find("</data>").unwrap_or(entry.len());
+        let body = &entry[..body_end];
+        let Some(loc) = body.find("<location") else {
+            continue;
+        };
+        let Some(href_start) = body[loc..].find("href=\"") else {
+            continue;
+        };
+        let val = &body[loc + href_start + 6..];
+        let Some(href_end) = val.find('"') else {
+            continue;
+        };
+        out.push((kind, val[..href_end].to_string()));
+    }
+    out
+}
+
+/// Filename fallback for a sync that copied metadata but whose repomd was
+/// already replaced by a previous regeneration. Only direct children of
+/// `repodata/` are considered by the caller.
+fn aux_kind_for_synced_filename(name: &str) -> Option<AuxKind> {
+    let lower = name.to_ascii_lowercase();
+    let stem = [".gz", ".xz", ".zst"]
+        .iter()
+        .find_map(|ext| lower.strip_suffix(ext))
+        .unwrap_or(lower.as_str());
+    if stem.ends_with("modules.yaml") || stem.ends_with("modules.yml") {
+        Some(AuxKind::Modules)
+    } else if stem.ends_with("updateinfo.xml") {
+        Some(AuxKind::Updateinfo)
+    } else if stem.contains("comps")
+        || stem.ends_with("group.xml")
+        || stem.ends_with("group_gz.xml")
+    {
+        Some(AuxKind::Comps)
+    } else {
+        None
+    }
+}
+
+/// Whether a storage key is an upstream metadata document copied into
+/// `repodata/` by an external sync (modules/comps/updateinfo), which the
+/// storage watcher must fingerprint so a metadata-only sync still rebuilds.
+///
+/// `.gz` is deliberately excluded: NORA writes its own `<checksum>-*.gz`
+/// repodata, so watching gzip would make every regeneration retrigger the
+/// watcher. Upstream documents NORA adopts are `.xz`/`.zst`/plain in practice.
+pub(crate) fn is_synced_metadata_key(key: &str) -> bool {
+    let Some(rest) = key.strip_prefix("rpm/") else {
+        return false;
+    };
+    let Some((repo, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    if repo.is_empty() {
+        return false;
+    }
+    let Some(name) = tail.strip_prefix(&format!("{REPODATA}/")) else {
+        return false;
+    };
+    if name.contains('/') || name.to_ascii_lowercase().ends_with(".gz") {
+        return false;
+    }
+    aux_kind_for_synced_filename(name).is_some()
+}
+
+/// Repo-relative repomd href → the storage key to read. Rejects absolute,
+/// traversal and non-`repodata/` paths: a synced repomd is untrusted input.
+fn synced_aux_key(repo: &str, href: &str) -> Option<String> {
+    let href = href.trim_start_matches('/');
+    if href.is_empty() || href.contains("..") || href.contains('\0') {
+        return None;
+    }
+    href.strip_prefix(&format!("{REPODATA}/"))?;
+    Some(format!("rpm/{repo}/{href}"))
+}
+
+/// A writer that refuses to grow past `cap`, so an xz bomb cannot exhaust RAM
+/// while `lzma-rs` (which has no built-in limit) decompresses it.
+struct CappedWriter {
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len().saturating_add(data.len()) > self.cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "metadata too large after decompression",
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Decompress a synced index by its extension (the same formats `nora mirror`
+/// accepts: gzip, xz, zstd, plain). bzip2 is not linked; such a document is
+/// reported as unsupported rather than silently skipped.
+fn decode_synced_metadata(name: &str, raw: &[u8]) -> Result<String, String> {
+    let lower = name.to_ascii_lowercase();
+    let out = if lower.ends_with(".gz") {
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(raw)
+            .take(ADOPT_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut out)
+            .map_err(|e| format!("{name}: {e}"))?;
+        out
+    } else if lower.ends_with(".xz") {
+        let mut writer = CappedWriter {
+            buf: Vec::new(),
+            cap: ADOPT_MAX_BYTES,
+        };
+        lzma_rs::xz_decompress(&mut &raw[..], &mut writer).map_err(|e| format!("{name}: {e:?}"))?;
+        writer.buf
+    } else if lower.ends_with(".zst") {
+        let mut out = Vec::new();
+        ruzstd::decoding::StreamingDecoder::new(raw)
+            .map_err(|e| format!("{name}: {e}"))?
+            .take(ADOPT_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut out)
+            .map_err(|e| format!("{name}: {e}"))?;
+        out
+    } else if lower.ends_with(".bz2") {
+        return Err(format!("{name}: bzip2 metadata is not supported"));
+    } else {
+        raw.to_vec()
+    };
+    if out.len() > ADOPT_MAX_BYTES {
+        return Err(format!("{name}: metadata too large after decompression"));
+    }
+    String::from_utf8(out).map_err(|e| format!("{name}: not UTF-8: {e}"))
+}
+
+/// Adopt modules/comps/updateinfo documents that an external sync copied into
+/// `repodata/`, storing them under `.nora-aux/` before regeneration prunes the
+/// upstream repodata. Without this a reposync that copies metadata wholesale
+/// still loses module streams, because NORA rebuilds repomd from RPM headers
+/// only.
+///
+/// Best-effort: a bad document is logged and skipped; the reindex itself never
+/// fails because of it. Content already current is not rewritten, so a watched
+/// `.nora-aux/` key does not churn and retrigger the storage watcher.
+async fn adopt_synced_metadata(storage: &crate::Storage, repo: &str, keys: &[String]) -> usize {
+    let repodata_prefix = format!("rpm/{repo}/{REPODATA}/");
+    let mut candidates: Vec<(AuxKind, String)> = Vec::new();
+
+    // Preferred source: the repomd the sync copied, which names the exact
+    // files upstream published.
+    if let Ok(raw) = storage.get(&repomd_key(repo)).await {
+        if let Ok(repomd) = String::from_utf8(raw.to_vec()) {
+            for (kind, href) in repomd_aux_locations(&repomd) {
+                if let Some(key) = synced_aux_key(repo, &href) {
+                    candidates.push((kind, key));
+                }
+            }
+        }
+    }
+
+    // Fallback: names left behind when a previous regeneration already replaced
+    // repomd.xml (the upstream blobs are pruned only at the end of this run).
+    let mut fallback: Vec<(AuxKind, String)> = keys
+        .iter()
+        .filter_map(|key| {
+            let name = key.strip_prefix(&repodata_prefix)?;
+            if name.contains('/') {
+                return None;
+            }
+            aux_kind_for_synced_filename(name).map(|kind| (kind, key.clone()))
+        })
+        .collect();
+    fallback.sort_by(|a, b| a.1.cmp(&b.1));
+    candidates.extend(fallback);
+
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|(kind, key)| seen.insert((*kind, key.clone())));
+
+    let mut adopted = 0usize;
+    for kind in AuxKind::ALL {
+        let target = aux_key(repo, kind);
+        let existing = storage.get(&target).await.ok();
+        for (_, source) in candidates.iter().filter(|(k, _)| *k == kind) {
+            let raw = match storage.get(source).await {
+                Ok(raw) => raw,
+                Err(crate::storage::StorageError::NotFound) => continue,
+                Err(e) => {
+                    tracing::warn!(repo = %repo, source = %source, error = %e,
+                        "rpm: read synced metadata failed");
+                    continue;
+                }
+            };
+            let text = match decode_synced_metadata(source, &raw) {
+                Ok(text) => text,
+                Err(e) => {
+                    tracing::warn!(repo = %repo, "rpm: {e}; skipping synced metadata");
+                    continue;
+                }
+            };
+            if let Err(msg) = kind.validate(&text) {
+                tracing::warn!(repo = %repo, source = %source, error = msg,
+                    "rpm: synced metadata failed validation; skipping");
+                continue;
+            }
+            if existing.as_deref() == Some(text.as_bytes()) {
+                // Current already; a different candidate (a fresh sync) may
+                // still supersede it, so keep looking instead of stopping.
+                continue;
+            }
+            match storage.put(&target, text.as_bytes()).await {
+                Ok(()) => {
+                    tracing::info!(
+                        repo = %repo,
+                        kind = kind.name(),
+                        source = %source,
+                        "rpm: adopted synced metadata into .nora-aux"
+                    );
+                    adopted += 1;
+                    break;
+                }
+                Err(e) => tracing::warn!(repo = %repo, source = %source, error = %e,
+                    "rpm: store adopted metadata failed"),
+            }
+        }
+    }
+    adopted
 }
 
 /// A path segment starting with `.` is server-owned (`.nora-meta`,
@@ -1221,6 +1484,11 @@ pub(crate) async fn reindex_repo(
         return Err(ReindexError::NotFound);
     }
 
+    // An external reposync may have copied the upstream modules/comps/
+    // updateinfo blobs along with the packages. Preserve them before the
+    // regeneration below prunes upstream repodata.
+    adopt_synced_metadata(storage, repo, &keys).await;
+
     let meta_prefix = format!("rpm/{repo}/{META_DIR}/");
     let mut packages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut sidecars: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -1595,6 +1863,79 @@ mod tests {
     }
 
     #[test]
+    fn synced_metadata_is_recognised_by_repomd_type_and_filename() {
+        let repomd = r#"<repomd>
+  <data type="primary"><location href="repodata/abc-primary.xml.gz"/></data>
+  <data type="modules"><location href="repodata/abc-modules.yaml.xz"/></data>
+  <data type="group"><location href="repodata/comps-AppStream.x86_64.xml"/></data>
+  <data type="updateinfo"><location href="repodata/abc-updateinfo.xml.gz"/></data>
+</repomd>"#;
+        assert_eq!(
+            repomd_aux_locations(repomd),
+            vec![
+                (AuxKind::Modules, "repodata/abc-modules.yaml.xz".to_string()),
+                (
+                    AuxKind::Comps,
+                    "repodata/comps-AppStream.x86_64.xml".to_string()
+                ),
+                (
+                    AuxKind::Updateinfo,
+                    "repodata/abc-updateinfo.xml.gz".to_string()
+                ),
+            ]
+        );
+
+        // Filename fallback, including NORA's own `group_gz` name.
+        for (name, kind) in [
+            ("abc-modules.yaml.xz", AuxKind::Modules),
+            ("modules.yml.gz", AuxKind::Modules),
+            ("abc-updateinfo.xml.gz", AuxKind::Updateinfo),
+            ("comps-AppStream.x86_64.xml", AuxKind::Comps),
+            ("abc-group.xml.gz", AuxKind::Comps),
+            ("abc-group_gz.xml.gz", AuxKind::Comps),
+        ] {
+            assert_eq!(aux_kind_for_synced_filename(name), Some(kind), "{name}");
+        }
+        for name in ["abc-primary.xml.gz", "repomd.xml", "notes.yaml"] {
+            assert_eq!(aux_kind_for_synced_filename(name), None, "{name}");
+        }
+
+        // hrefs are untrusted: only direct-or-nested repodata paths are read.
+        assert_eq!(
+            synced_aux_key("myrepo", "repodata/abc-modules.yaml.xz").as_deref(),
+            Some("rpm/myrepo/repodata/abc-modules.yaml.xz")
+        );
+        for href in [
+            "Packages/x.rpm",
+            "../repodata/x",
+            "repodata/../../etc/passwd",
+        ] {
+            assert_eq!(synced_aux_key("myrepo", href), None, "{href}");
+        }
+    }
+
+    #[test]
+    fn synced_metadata_decodes_gzip_xz_and_plain() {
+        use super::integration_tests::{gzip, MODULES_YAML};
+        let text = MODULES_YAML.as_bytes();
+        assert_eq!(
+            decode_synced_metadata("modules.yaml", text).unwrap(),
+            MODULES_YAML
+        );
+        assert_eq!(
+            decode_synced_metadata("modules.yaml.gz", &gzip(text)).unwrap(),
+            MODULES_YAML
+        );
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut &text[..], &mut xz).unwrap();
+        assert_eq!(
+            decode_synced_metadata("modules.yaml.xz", &xz).unwrap(),
+            MODULES_YAML
+        );
+        assert!(decode_synced_metadata("modules.yaml.bz2", text).is_err());
+    }
+
+    #[test]
     fn test_validate_package_path() {
         assert!(validate_package_path("myrepo", "Packages/foo-1.0-1.x86_64.rpm").is_ok());
         assert!(validate_package_path("myrepo", "foo.rpm").is_ok());
@@ -1700,7 +2041,7 @@ mod integration_tests {
 
     /// Build a real .rpm in memory with a known dependency, config file,
     /// binary, and changelog — exercises the same parse path dnf publishes hit.
-    fn build_test_rpm(name: &str, version: &str) -> Vec<u8> {
+    pub(super) fn build_test_rpm(name: &str, version: &str) -> Vec<u8> {
         let pkg = rpm::PackageBuilder::new(name, version, "MIT", "x86_64", "A test package")
             .release("1")
             .description("Test package for the NORA rpm registry")
@@ -1936,10 +2277,11 @@ mod integration_tests {
         assert!(a < b, "packages must be sorted by name");
     }
 
-    const MODULES_YAML: &str =
+    pub(super) const MODULES_YAML: &str =
         "---\ndocument: modulemd\nversion: 2\ndata:\n  name: php\n  stream: 8.2\n...\n";
-    const COMPS_XML: &str = "<?xml version=\"1.0\"?>\n<comps><group><id>php</id></group></comps>";
-    const UPDATEINFO_XML: &str =
+    pub(super) const COMPS_XML: &str =
+        "<?xml version=\"1.0\"?>\n<comps><group><id>php</id></group></comps>";
+    pub(super) const UPDATEINFO_XML: &str =
         "<?xml version=\"1.0\"?>\n<updates><update type=\"security\"><id>NORA-1</id></update></updates>";
 
     #[test]
@@ -1958,7 +2300,7 @@ mod integration_tests {
         );
     }
 
-    fn gzip(data: &[u8]) -> Vec<u8> {
+    pub(super) fn gzip(data: &[u8]) -> Vec<u8> {
         use flate2::write::GzEncoder;
         use std::io::Write;
         let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -1967,7 +2309,7 @@ mod integration_tests {
     }
 
     /// Repomd `<data>` entries whose location href ends with the given suffix.
-    fn repomd_entries(repomd: &str, kind: &str) -> Vec<String> {
+    pub(super) fn repomd_entries(repomd: &str, kind: &str) -> Vec<String> {
         let needle = "repodata/";
         let prefix = format!("{kind}\"");
         repomd
@@ -2591,6 +2933,9 @@ mod signing_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod reindex_tests {
+    use super::integration_tests::{
+        build_test_rpm, gzip, repomd_entries, COMPS_XML, MODULES_YAML, UPDATEINFO_XML,
+    };
     use crate::test_helpers::{body_bytes, create_test_context, send};
     use axum::http::{Method, StatusCode};
 
@@ -2676,6 +3021,158 @@ mod reindex_tests {
         )
         .await;
         assert_eq!(asc.status(), StatusCode::OK);
+    }
+
+    /// A reposync that copies upstream repodata (as `nora mirror rpm` does)
+    /// must not lose module streams: the documents are moved into `.nora-aux`
+    /// before regeneration prunes the upstream blobs.
+    #[tokio::test]
+    async fn test_reindex_adopts_synced_metadata_from_repomd() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/a.rpm",
+            build_test_rpm("aaa", "1.0"),
+        )
+        .await;
+
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut &MODULES_YAML.as_bytes()[..], &mut xz).unwrap();
+        let synced = [
+            (
+                "rpm/myrepo/repodata/aaa-modules.yaml.xz",
+                xz,
+                "modules",
+                "repodata/aaa-modules.yaml.xz",
+            ),
+            (
+                "rpm/myrepo/repodata/bbb-comps.xml.gz",
+                gzip(COMPS_XML.as_bytes()),
+                "group_gz",
+                "repodata/bbb-comps.xml.gz",
+            ),
+            (
+                "rpm/myrepo/repodata/ccc-updateinfo.xml",
+                UPDATEINFO_XML.as_bytes().to_vec(),
+                "updateinfo",
+                "repodata/ccc-updateinfo.xml",
+            ),
+        ];
+        let mut repomd = String::from("<repomd>");
+        for (key, body, ty, href) in &synced {
+            ctx.state.storage.put(key, body).await.unwrap();
+            repomd.push_str(&format!(
+                "<data type=\"{ty}\"><location href=\"{href}\"/></data>"
+            ));
+        }
+        repomd.push_str("</repomd>");
+        ctx.state
+            .storage
+            .put("rpm/myrepo/repodata/repomd.xml", repomd.as_bytes())
+            .await
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::POST, "/rpm/myrepo/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        for (file, expected) in [
+            ("modules.yaml", MODULES_YAML),
+            ("comps.xml", COMPS_XML),
+            ("updateinfo.xml", UPDATEINFO_XML),
+        ] {
+            assert_eq!(
+                ctx.state
+                    .storage
+                    .get(&format!("rpm/myrepo/.nora-aux/{file}"))
+                    .await
+                    .unwrap(),
+                expected.as_bytes(),
+                "{file}"
+            );
+        }
+        let repomd = String::from_utf8(
+            body_bytes(send(&ctx.app, Method::GET, "/rpm/myrepo/repodata/repomd.xml", "").await)
+                .await
+                .to_vec(),
+        )
+        .unwrap();
+        for kind in ["modules", "group_gz", "updateinfo"] {
+            assert_eq!(repomd_entries(&repomd, kind).len(), 1, "{kind}: {repomd}");
+        }
+        // The synced upstream blobs were pruned after adoption.
+        for (key, ..) in &synced {
+            assert!(ctx.state.storage.stat(key).await.is_none(), "{key}");
+        }
+    }
+
+    /// Fallback: a previous run already replaced repomd.xml, so the only trace
+    /// of the synced document is its filename. New synced content replaces a
+    /// stale `.nora-aux` document (the sync is authoritative).
+    #[tokio::test]
+    async fn test_reindex_adopts_synced_metadata_by_filename() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/a.rpm",
+            build_test_rpm("aaa", "1.0"),
+        )
+        .await;
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/-/metadata/modules",
+            MODULES_YAML,
+        )
+        .await;
+
+        let synced =
+            "---\ndocument: modulemd\nversion: 2\ndata:\n  name: php\n  stream: 8.3\n...\n";
+        ctx.state
+            .storage
+            .put(
+                "rpm/myrepo/repodata/xyz-modules.yaml.gz",
+                &gzip(synced.as_bytes()),
+            )
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::POST, "/rpm/myrepo/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            ctx.state
+                .storage
+                .get("rpm/myrepo/.nora-aux/modules.yaml")
+                .await
+                .unwrap(),
+            synced.as_bytes()
+        );
+    }
+
+    /// A malformed synced document is skipped without failing the reindex.
+    #[tokio::test]
+    async fn test_reindex_ignores_invalid_synced_metadata() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/a.rpm",
+            build_test_rpm("aaa", "1.0"),
+        )
+        .await;
+        ctx.state
+            .storage
+            .put("rpm/myrepo/repodata/junk-modules.yaml", b"not modulemd")
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::POST, "/rpm/myrepo/-/reindex", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(ctx
+            .state
+            .storage
+            .stat("rpm/myrepo/.nora-aux/modules.yaml")
+            .await
+            .is_none());
     }
 
     /// Out-of-band addition: a package dropped straight into storage gets

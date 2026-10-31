@@ -35,7 +35,7 @@ use crate::repo_index::RepoIndex;
 use crate::signing::RepoSigner;
 use crate::storage::Storage;
 use crate::ui::UiEventBus;
-use crate::PublishLocks;
+use crate::{LiveConfig, PublishLocks};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -64,10 +64,13 @@ fn prefix_registry(prefix: &str) -> Option<RegistryType> {
 /// Server-generated files are deliberately excluded:
 /// - deb: `Packages`, `Packages.gz`, `Release`, `Release.gpg`, `InRelease`,
 ///   `dists/...`, `.nora-meta/...` — none end in `.deb`.
-/// - rpm: `repodata/...` — excluded by the segment check; `.nora-meta/...`
-///   sidecars do not end in `.rpm`. Operator-supplied auxiliary metadata
-///   (`.nora-aux/modules.yaml`, `comps.xml`, `updateinfo.xml`) *is* watched:
-///   an external reposync may drop it, and it must trigger a repomd rebuild.
+/// - rpm: package files, `.nora-meta/...` sidecars do not end in `.rpm` and
+///   generated `repodata/*.gz` is server-owned. Operator-supplied auxiliary
+///   metadata (`.nora-aux/modules.yaml`, `comps.xml`, `updateinfo.xml`) *is*
+///   watched, and so are the uncompressed/xz/zstd upstream documents a
+///   reposync copies into `repodata/`: an external sync may drop either, and
+///   it must trigger a repomd rebuild. `.gz` under `repodata/` is excluded
+///   because NORA generates gzip blobs itself.
 /// - raw: every file under `raw/` is user data.
 fn is_watched_artifact(key: &str) -> bool {
     if let Some(rest) = key.strip_prefix("deb/") {
@@ -75,9 +78,43 @@ fn is_watched_artifact(key: &str) -> bool {
     } else if let Some(rest) = key.strip_prefix("rpm/") {
         (rest.to_ascii_lowercase().ends_with(".rpm") && !rest.split('/').any(|s| s == "repodata"))
             || rpm::is_aux_key(key)
+            || rpm::is_synced_metadata_key(key)
     } else {
         key.starts_with("raw/")
     }
+}
+
+/// Whether `key` belongs in the watcher's fingerprint: a user-input artifact
+/// of an enabled registry, outside every RPM proxy repository.
+///
+/// Proxy caches hold upstream packages *and* upstream repodata. Reindexing such
+/// a repo would regenerate repomd from RPM headers and prune the upstream
+/// modules/comps/updateinfo documents, so dnf loses module streams. NORA's own
+/// proxy path already maintains those repos; the watcher must leave them alone.
+fn should_fingerprint(
+    key: &str,
+    enabled_registries: &HashSet<RegistryType>,
+    proxied_rpm_repos: &HashSet<&str>,
+) -> bool {
+    if !is_watched_artifact(key) {
+        return false;
+    }
+    let Some((prefix, rest)) = key.split_once('/') else {
+        return false;
+    };
+    let Some(rt) = prefix_registry(&format!("{prefix}/")) else {
+        return false;
+    };
+    if !enabled_registries.contains(&rt) {
+        return false;
+    }
+    if rt == RegistryType::Rpm {
+        let repo = rest.split('/').next().unwrap_or("");
+        if proxied_rpm_repos.contains(repo) {
+            return false;
+        }
+    }
+    true
 }
 
 /// One full scan of the watched prefixes. `None` on a listing error — the
@@ -86,8 +123,10 @@ fn is_watched_artifact(key: &str) -> bool {
 async fn snapshot(
     storage: &Storage,
     enabled_registries: &HashSet<RegistryType>,
+    live_config: &LiveConfig,
 ) -> Option<Fingerprint> {
     let mut fp = Fingerprint::new();
+    let proxied: HashSet<&str> = live_config.rpm.proxies.keys().map(String::as_str).collect();
     let keys = match storage.list_with_meta("").await {
         Ok(k) => k,
         Err(e) => {
@@ -96,14 +135,8 @@ async fn snapshot(
         }
     };
     for (key, meta) in keys {
-        if is_watched_artifact(&key) {
-            if let Some(prefix) = key.split('/').next().map(|p| format!("{p}/")) {
-                if let Some(rt) = prefix_registry(&prefix) {
-                    if enabled_registries.contains(&rt) {
-                        fp.insert(key, (meta.size, meta.modified));
-                    }
-                }
-            }
+        if should_fingerprint(&key, enabled_registries, &proxied) {
+            fp.insert(key, (meta.size, meta.modified));
         }
     }
     Some(fp)
@@ -160,6 +193,7 @@ pub async fn run_storage_watch(
     repo_index: Arc<RepoIndex>,
     signer: Option<Arc<RepoSigner>>,
     enabled_registries: Arc<HashSet<RegistryType>>,
+    live_config: Arc<LiveConfig>,
     publish_locks: PublishLocks,
     ui_events: Arc<UiEventBus>,
     cfg: WatchConfig,
@@ -185,7 +219,7 @@ pub async fn run_storage_watch(
             _ = interval.tick() => {}
         }
 
-        let Some(snap) = snapshot(&storage, &enabled_registries).await else {
+        let Some(snap) = snapshot(&storage, &enabled_registries, &live_config).await else {
             continue;
         };
 
@@ -239,7 +273,8 @@ pub async fn run_storage_watch(
                 // still changing, keep the old baseline and re-evaluate next
                 // tick instead of parsing a half-written package.
                 tokio::time::sleep(std::time::Duration::from_secs(cfg.settle_secs)).await;
-                let Some(snap2) = snapshot(&storage, &enabled_registries).await else {
+                let Some(snap2) = snapshot(&storage, &enabled_registries, &live_config).await
+                else {
                     continue;
                 };
                 if snap2 != snap {
@@ -419,10 +454,64 @@ mod tests {
         assert!(is_watched_artifact("rpm/myrepo/.nora-aux/updateinfo.xml"));
         assert!(!is_watched_artifact("rpm/myrepo/.nora-aux/notes.txt"));
         assert!(!is_watched_artifact("rpm/.nora-aux/modules.yaml"));
+        // Upstream metadata copied by a reposync triggers a rebuild; NORA's own
+        // generated `.gz` blobs must not (they are rewritten by every rebuild).
+        assert!(is_watched_artifact(
+            "rpm/myrepo/repodata/abc-modules.yaml.xz"
+        ));
+        assert!(is_watched_artifact(
+            "rpm/myrepo/repodata/comps-AppStream.x86_64.xml"
+        ));
+        assert!(is_watched_artifact(
+            "rpm/myrepo/repodata/abc-updateinfo.xml"
+        ));
+        assert!(!is_watched_artifact(
+            "rpm/myrepo/repodata/abc-modules.yaml.gz"
+        ));
+        assert!(!is_watched_artifact(
+            "rpm/myrepo/repodata/abc-primary.xml.gz"
+        ));
         assert!(is_watched_artifact("raw/notes.txt"));
         assert!(is_watched_artifact("raw/sub/dir/data.bin"));
         assert!(!is_watched_artifact("npm/lodash/tarballs/lodash.tgz"));
         assert!(!is_watched_artifact(".nora-pins.ndjson"));
+    }
+
+    #[test]
+    fn proxy_cached_repos_are_never_reindexed() {
+        let enabled = HashSet::from([RegistryType::Deb, RegistryType::Rpm]);
+        let proxied = HashSet::from(["appstream", "rocky"]);
+        // A proxy cache's packages and repodata are upstream data: regenerating
+        // the repo would drop its modules/comps documents.
+        assert!(!should_fingerprint(
+            "rpm/appstream/Packages/php-fpm-8.3.36.rpm",
+            &enabled,
+            &proxied
+        ));
+        assert!(!should_fingerprint(
+            "rpm/rocky/9/AppStream/x86_64/os/Packages/php.rpm",
+            &enabled,
+            &proxied
+        ));
+        assert!(!should_fingerprint(
+            "rpm/rocky/9/AppStream/x86_64/os/repodata/x-modules.yaml.xz",
+            &enabled,
+            &proxied
+        ));
+        // Hosted repos are still watched.
+        assert!(should_fingerprint("rpm/myrepo/php.rpm", &enabled, &proxied));
+        // Proxy names only affect the rpm registry.
+        assert!(should_fingerprint(
+            "deb/appstream/pkg_1.0_all.deb",
+            &enabled,
+            &proxied
+        ));
+        // Turned-off registries stay unwatched.
+        assert!(!should_fingerprint(
+            "rpm/myrepo/php.rpm",
+            &HashSet::from([RegistryType::Deb]),
+            &proxied
+        ));
     }
 
     /// Apply the same artifact filter `snapshot` uses, so fingerprints only

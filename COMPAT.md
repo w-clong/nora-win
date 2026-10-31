@@ -316,14 +316,14 @@ upstream's signatures) is served verbatim within `rpm.metadata_ttl` seconds
 | GPG-signed repodata (`repomd.xml.asc`) | Full | Signed on every regeneration; verify with `repo_gpgcheck=1`. Object-store backends (S3/GCS) require `signing.key_path` — without it signing is disabled with a startup warning. A provisioned key must be Ed25519 (since 1.4.2); any other algorithm is a fatal startup error |
 | Public key (`repodata/repomd.xml.key`) | Full | Armored, for `gpgkey=`; key auto-generated at first boot |
 | Package signatures (`gpgcheck=1`) | — | Packages are stored as uploaded; NORA signs metadata, not packages |
-| Reconcile (`POST {repo}/-/reindex`) | Full | Heals out-of-band storage changes: drops orphan metadata, adopts added packages, rebuilds + re-signs repodata |
-| Upstream proxy | Full | Per-repo pull-through via `[rpm.proxies]`; digest quarantine via `[curation.rpm]` |
+| Reconcile (`POST {repo}/-/reindex`) | Full | Heals out-of-band storage changes: drops orphan metadata, adopts added packages and synced modules/comps/updateinfo documents, rebuilds + re-signs repodata |
+| Upstream proxy | Full | Per-repo pull-through via `[rpm.proxies]`; digest quarantine via `[curation.rpm]`. Proxy repos are never reindexed, so upstream `modules`/`group_gz`/`updateinfo` entries survive |
 | Offline mirror | Full | `nora mirror rpm --repo <name> [--arch x86_64,noarch]` warms the full package set |
 | sqlite metadata (`*_db`) | — | XML metadata only (all modern dnf/yum versions) |
 | Delta RPMs (`prestodelta`) | — | Not generated |
-| Module metadata (`modules.yaml`) | Full | Hosted: publish with `PUT {repo}/-/metadata/modules` (raw or gzip; repomd entry `type="modules"` is generated and survives reindexes). Proxied: the upstream's `modules` entry is passed through and cached like the other repodata files, and `nora mirror rpm` warms it |
-| Group/comps metadata | Full | Hosted: `PUT {repo}/-/metadata/comps` (repomd `type="group_gz"`). Proxied: passed through |
-| Updateinfo/errata | Full | Hosted: `PUT {repo}/-/metadata/updateinfo` (repomd `type="updateinfo"`). Proxied: passed through |
+| Module metadata (`modules.yaml`) | Full | Hosted: `PUT {repo}/-/metadata/modules` (raw or gzip; repomd entry `type="modules"` is generated and survives reindexes), or let a reposync copy the upstream `modules` document into `repodata/` — reindex adopts it into `.nora-aux/` before pruning. Proxied: the upstream's `modules` entry is passed through and cached like the other repodata files, and `nora mirror rpm` warms it |
+| Group/comps metadata | Full | Hosted: `PUT {repo}/-/metadata/comps` or a synced `comps*.xml`/`group*.xml` (repomd `type="group_gz"`). Proxied: passed through |
+| Updateinfo/errata | Full | Hosted: `PUT {repo}/-/metadata/updateinfo` or a synced `updateinfo.xml` (repomd `type="updateinfo"`). Proxied: passed through |
 | Auxiliary metadata delete/list | Full | `DELETE {repo}/-/metadata/{kind}`, `GET {repo}/-/metadata`; rebuilding and pruning repodata never removes the stored documents |
 
 Publish: `curl -u user:pass -T pkg.rpm http://nora:4000/rpm/myrepo/pkg.rpm`
@@ -335,6 +335,14 @@ curl -u user:pass -T modules.yaml http://nora:4000/rpm/myrepo/-/metadata/modules
 curl -u user:pass -T comps.xml    http://nora:4000/rpm/myrepo/-/metadata/comps
 curl -u user:pass -T updateinfo.xml http://nora:4000/rpm/myrepo/-/metadata/updateinfo
 ```
+
+A reposync that copies upstream `repodata/` into a hosted repo (for example
+`dnf reposync --download-metadata`, or `nora mirror rpm`) needs no extra step:
+the next reindex reads `repomd.xml`, decompresses the `modules`, `group`/
+`group_gz` and `updateinfo` documents (gzip, xz, zstd or plain) and stores them
+in `.nora-aux/` before pruning. A sync that copies only `.rpm` files cannot
+convey module streams — modulemd is not derivable from RPM headers — so upload
+`modules.yaml` with the API above, or add `--download-metadata` to the sync.
 
 Client `.repo` file:
 

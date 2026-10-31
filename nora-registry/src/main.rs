@@ -3703,6 +3703,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         let repo_index = Arc::clone(&state.repo_index);
         let signer = state.signer.clone();
         let enabled_registries = Arc::clone(&state.enabled_registries);
+        let live_config = Arc::clone(&state.config);
         let publish_locks = state.publish_locks.clone();
         let ui_events = Arc::clone(&state.ui_events);
         let cfg = state.config.watch.clone();
@@ -3714,6 +3715,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                 Arc::clone(&repo_index),
                 signer.clone(),
                 Arc::clone(&enabled_registries),
+                Arc::clone(&live_config),
                 publish_locks.clone(),
                 Arc::clone(&ui_events),
                 cfg.clone(),
