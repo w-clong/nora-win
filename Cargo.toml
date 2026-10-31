@@ -44,6 +44,11 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 [profile.release]
 debug = false
 strip = true
+# Size-first codegen: the single binary carries every protocol, TLS stack and
+# cloud backend, so LLVM's size optimization removes ~28% on Windows x64 with
+# little throughput cost — the server is I/O-bound. `release-official` inherits
+# this setting.
+opt-level = "s"
 codegen-units = 4
 # Unwind, so a panic ends the request or task it happened in, not the process: the
 # `catch_unwind` guards and the panic layer only work under unwind.

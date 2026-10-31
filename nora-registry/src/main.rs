@@ -955,6 +955,7 @@ mod panic_strategy_tests {
         "inherits",
         "debug",
         "strip",
+        "opt-level",
         "codegen-units",
         "panic",
         "lto",

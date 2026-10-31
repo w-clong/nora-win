@@ -250,9 +250,11 @@ compatibility matrices, and runtime loading failures.
 
 **Rationale:** A single binary eliminates deployment complexity. There are
 no plugins to install, no versions to align, no ClassNotFoundExceptions.
-The stripped binary is ~28 MB with the `release-official` profile (fat LTO,
-`codegen-units = 1`) that the Dockerfile builds, and ~33 MB with the default
-`release` profile (thin LTO, `codegen-units = 4`); the default `cargo build`
+The stripped binary is ~20 MB with the `release-official` profile (fat LTO,
+`codegen-units = 1`, `opt-level = "s"`) that the Dockerfile builds, and ~24 MB
+with the default `release` profile (thin LTO, `codegen-units = 4`,
+`opt-level = "s"`); `opt-level = "s"` is about a quarter smaller than the
+previous `opt-level = 3` builds (28 MB and 33 MB). The default `cargo build`
 debug binary is ~56 MB, with a separate ~330 MB PDB on Windows — compare
 release artifacts with release, not with debug. The Alpine Docker image adds
 ~8–10 MB. The trade-off is that unused formats still occupy binary space —
