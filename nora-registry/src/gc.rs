@@ -1165,8 +1165,8 @@ pub struct ProxyCacheEviction {
 /// Index files that must never be evicted — they are regenerated indexes,
 /// not proxy-cached packages.
 fn is_index_file(key: &str) -> bool {
-    // rpm: repodata/
-    if key.contains("/repodata/") {
+    // rpm: repodata/ and operator-supplied auxiliary metadata
+    if key.contains("/repodata/") || key.contains("/.nora-aux/") {
         return true;
     }
     // deb: Packages, Packages.gz, Release, InRelease, etc.
@@ -3421,6 +3421,11 @@ mod tests {
             .put("deb/repo/dists/stable/InRelease", &payload)
             .await
             .unwrap();
+        // Operator-supplied RPM auxiliary metadata is source data, not a cache entry.
+        storage
+            .put("rpm/repo/.nora-aux/modules.yaml", &payload)
+            .await
+            .unwrap();
         // One real proxy package
         storage
             .put("rpm/repo/Packages/evictme-1.0.rpm", &payload)
@@ -3440,6 +3445,7 @@ mod tests {
             .is_ok());
         assert!(storage.get("deb/repo/dists/stable/Release").await.is_ok());
         assert!(storage.get("deb/repo/dists/stable/InRelease").await.is_ok());
+        assert!(storage.get("rpm/repo/.nora-aux/modules.yaml").await.is_ok());
     }
 
     /// Hugging Face files (#579) count toward the same cap as rpm/deb, oldest first across

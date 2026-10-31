@@ -597,7 +597,7 @@ pub async fn leak_detection_middleware(
     let response = next.run(request).await;
 
     // Fast path: skip if no finders configured
-    if state.leak_finders.is_empty() {
+    if state.leak_finders().is_empty() {
         return response;
     }
 
@@ -714,7 +714,7 @@ pub async fn leak_detection_middleware(
         &body_bytes[..]
     };
 
-    if let Some((registry, hostname)) = state.leak_finders.scan(haystack) {
+    if let Some((registry, hostname)) = state.leak_finders().scan(haystack) {
         UPSTREAM_URL_LEAK_TOTAL.with_label_values(&[registry]).inc();
         tracing::warn!(
             registry = registry,
@@ -1042,9 +1042,13 @@ mod tests {
         body: &'static str,
     ) -> (axum::Router, AppState) {
         use axum::routing::get;
-        let mut ctx = crate::test_helpers::create_test_context();
-        ctx.state.leak_finders =
-            LeakFinders::new(vec![(registry_label.to_string(), canary_host.to_string())]);
+        let ctx = crate::test_helpers::create_test_context();
+        ctx.state
+            .leak_finders
+            .store(std::sync::Arc::new(LeakFinders::new(vec![(
+                registry_label.to_string(),
+                canary_host.to_string(),
+            )])));
         let state = ctx.state.clone();
         // The leak middleware only inspects the response body — it never touches
         // storage — so the context's tempdir may drop at the end of this helper

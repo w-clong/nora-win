@@ -1,6 +1,16 @@
 # Changelog
 ## [Unreleased]
 
+### Added
+- **Configuration hot reload, with a settings page** — `GET /ui/settings` (linked in the sidebar) shows `public_url` and the configuration file, with a button that re-reads the file and applies its reloadable settings without a restart. The same reload is available to automation as `POST /api/v1/admin/reload?dry_run=true|false` (admin token) and on Unix as `SIGHUP`. Applied: `server.public_url`, every registry's upstreams/proxies/timeouts/TTLs, and curation (allowlist, blocklist, release age). Reported but not applied until a restart: auth, storage, TLS, ports and connection limits, rate limits, enabled registries, gc, retention, watch, signing, audit, circuit breaker, and the digest quarantine. An invalid file, or an allowlist that no longer parses, changes nothing. If auth is enabled the settings routes always require credentials — an admin token, or a Basic account listed in `auth.admin_users` — even under `anonymous_read` / `public_web_ui`.
+- **Hosted RPM repositories can carry module streams, comps and updateinfo** — `PUT /rpm/{repo}/-/metadata/{modules|comps|updateinfo}` stores `modules.yaml`, `comps.xml` or `updateinfo.xml` (raw or gzip) and regenerates `repodata/`, adding `type="modules"`, `"group_gz"` and `"updateinfo"` entries with checksums. `GET /rpm/{repo}/-/metadata` lists what is stored and `DELETE` removes a document and its repomd entry. Repodata rebuilds and the stale-generation prune leave the documents and their entries in place; the storage watcher picks up files dropped into `.nora-aux/` by an external reposync and rebuilds the repo. Proxy repositories already passed the upstream's `modules` entry through; `.yaml`/`.yaml.gz` now get a proper content type.
+
+### Changed
+- **Release binaries are built with the `release-official` profile** — the Dockerfile's amd64 and arm64 stages now use fat LTO with `codegen-units = 1`, which measured 28.4 MB instead of 33.2 MB on Windows (about 14 % smaller) at roughly three times the final-crate build time. `panic = "unwind"` and mimalloc are unchanged. `cargo build --release` (thin LTO) remains the faster local build.
+
+### Fixed
+- **Hosted RPM repodata dropped module and comps metadata** — a repository whose `repodata/` already had `modules.yaml` from a sync lost it on the next package publish, and PHP/AppStream module installs failed with "module not found". The rebuild now merges the operator-supplied documents (see Added), and the proxy-cache evictor no longer treats `.nora-aux/` as a cache candidate.
+
 ## [1.4.3] - 2026-10-27
 
 ### Added

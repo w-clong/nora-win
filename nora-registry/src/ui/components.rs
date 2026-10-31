@@ -389,6 +389,28 @@ pub fn sidebar_dark_with_registries(
         String::new()
     };
 
+    // Settings: always reachable from the sidebar. When auth is enabled the page itself
+    // rejects anyone who is neither an admin token nor an `auth.admin_users` account.
+    let settings_active = if active == "settings" {
+        "bg-slate-700 text-white"
+    } else {
+        "text-slate-300 hover:bg-slate-700 hover:text-white"
+    };
+    let settings_section = format!(
+        r##"
+            <div class="border-t border-slate-700 mt-6 pt-4">
+                <a href="/ui/settings" class="flex items-center px-4 py-3 text-sm font-medium rounded-lg transition-colors {}">
+                    <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317a1.724 1.724 0 013.35 0 1.724 1.724 0 002.573 1.066 1.724 1.724 0 012.37 2.37 1.724 1.724 0 001.065 2.572 1.724 1.724 0 010 3.35 1.724 1.724 0 00-1.065 2.572 1.724 1.724 0 01-2.37 2.37 1.724 1.724 0 00-2.572 1.065 1.724 1.724 0 01-3.35 0 1.724 1.724 0 00-2.572-1.065 1.724 1.724 0 01-2.37-2.37 1.724 1.724 0 00-1.065-2.572 1.724 1.724 0 010-3.35 1.724 1.724 0 001.065-2.572 1.724 1.724 0 012.37-2.37 1.724 1.724 0 002.572-1.065z"/>
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                    </svg>
+                    {}
+                </a>
+            </div>
+        "##,
+        settings_active, t.nav_settings
+    );
+
     format!(
         r#"
         <div id="sidebar" class="fixed md:static inset-y-0 left-0 z-50 w-64 bg-slate-800 text-white flex flex-col transform -translate-x-full md:translate-x-0 transition-transform duration-200 ease-in-out">
@@ -406,6 +428,7 @@ pub fn sidebar_dark_with_registries(
                 {}
                 {}
                 {}
+                {}
             </nav>
             <div class="px-4 py-4 border-t border-slate-700">
                 <div class="text-xs text-slate-400">
@@ -414,7 +437,7 @@ pub fn sidebar_dark_with_registries(
             </div>
         </div>
     "#,
-        dashboard_html, registries_section, admin_section, VERSION
+        dashboard_html, registries_section, admin_section, settings_section, VERSION
     )
 }
 

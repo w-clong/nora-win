@@ -34,8 +34,8 @@ ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release --locked -p nora-registry $CARGO_FEATURES && \
-    cp target/release/nora /nora && \
+    cargo build --profile release-official --locked -p nora-registry $CARGO_FEATURES && \
+    cp target/release-official/nora /nora && \
     strip /nora && \
     ! grep -qF '/__fi/' /nora
 
@@ -67,8 +67,8 @@ ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release --locked --target aarch64-unknown-linux-musl -p nora-registry $CARGO_FEATURES && \
-    cp target/aarch64-unknown-linux-musl/release/nora /nora && \
+    cargo build --profile release-official --locked --target aarch64-unknown-linux-musl -p nora-registry $CARGO_FEATURES && \
+    cp target/aarch64-unknown-linux-musl/release-official/nora /nora && \
     aarch64-linux-musl-strip /nora && \
     ! grep -qF '/__fi/' /nora
 

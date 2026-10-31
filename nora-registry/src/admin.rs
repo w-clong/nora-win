@@ -34,7 +34,52 @@ const REINDEX_MIN_INTERVAL_SECS: u64 = 10;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/admin/reindex", post(reindex))
+        .route("/api/v1/admin/reload", post(reload))
         .route("/api/v1/admin/tokens", post(admin_create_token))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ReloadQuery {
+    /// Validate and report what a reload would do, without installing it.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Re-read the configuration file and apply its reloadable settings (`public_url`,
+/// registry upstreams/proxies, curation) without a restart.
+///
+/// Admin-only (enforced in middleware). Auth, storage, TLS, ports, enabled registries
+/// and the digest quarantine keep their startup values; the response lists those keys
+/// under `restart_required` when the file changed them.
+async fn reload(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Query(query): Query<ReloadQuery>,
+) -> Response {
+    match crate::reload_config(&state, crate::Config::path_from_env(), query.dry_run) {
+        Ok(outcome) => {
+            state.audit.log(AuditEntry::new(
+                if query.dry_run {
+                    "reload.dry_run"
+                } else {
+                    "reload"
+                },
+                &user.0,
+                "",
+                "config",
+                "",
+            ));
+            if !query.dry_run {
+                state.ui_events.notify_changed();
+            }
+            (StatusCode::OK, Json(outcome)).into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

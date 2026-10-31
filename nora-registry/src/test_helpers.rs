@@ -343,7 +343,9 @@ fn build_context_full(
         bypass_token,
     }));
 
-    let leak_finders = crate::metrics::LeakFinders::new(config.upstream_hostnames());
+    let leak_finders = Arc::new(arc_swap::ArcSwap::from_pointee(
+        crate::metrics::LeakFinders::new(config.upstream_hostnames()),
+    ));
 
     let enabled_registries = Arc::new(enabled_registries);
     let signing_dir = TempDir::new().expect("signing tempdir");
@@ -388,7 +390,7 @@ fn build_context_full(
     let (tasks, maintenance) = crate::supervision(&config.server);
     let state = AppState {
         storage,
-        config: Arc::new(config),
+        config: crate::LiveConfig::new(config),
         enabled_registries: enabled_registries.clone(),
         start_time: Instant::now(),
         startup_duration_ms: 0,
@@ -1307,14 +1309,11 @@ pub async fn background_writes_done(storage: &Storage, holders: usize) {
 
 /// A SIGHUP on `ctx`: the configuration NORA started with, changed by `customize`, is written
 /// to a file, and the server's own reload reads that file and installs the engine it describes.
-/// The state keeps the configuration NORA started with, as it does in the server.
 pub fn reload_curation(ctx: &TestContext, customize: impl FnOnce(&mut Config)) {
     let (_dir, file) = reload_file(ctx, customize);
     // The reload applies the env overrides, so no other test may change them meanwhile.
     let _lock = crate::test_env::env_lock();
-    let held = crate::HeldQuarantine::of(&ctx.state.config.curation);
-    crate::reload_curation(&ctx.state.reloadable, &held, Some(file))
-        .expect("the reloaded curation builds");
+    crate::reload_config(&ctx.state, Some(file), false).expect("the reloaded configuration builds");
 }
 
 /// The file a SIGHUP on `ctx` would read: the configuration NORA started with, changed by
@@ -1323,11 +1322,16 @@ pub fn reload_file(
     ctx: &TestContext,
     customize: impl FnOnce(&mut Config),
 ) -> (tempfile::TempDir, String) {
+    // The test server listens on no port; a file the server loads names one, and the reload
+    // does not read it. Mirror that port into the live configuration as well, so the reload's
+    // startup-key report does not name a port that only the test's placeholder differs on.
+    if ctx.state.config.server.port == 0 {
+        let mut live = (*ctx.state.config).clone();
+        live.server.port = crate::config::ServerConfig::default().port;
+        ctx.state.config.replace(live);
+    }
     let mut config = (*ctx.state.config).clone();
     customize(&mut config);
-    // The test server listens on no port; a file the server loads names one, and the reload
-    // does not read it.
-    config.server.port = crate::config::ServerConfig::default().port;
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("config.toml");
     std::fs::write(

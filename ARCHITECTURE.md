@@ -250,9 +250,13 @@ compatibility matrices, and runtime loading failures.
 
 **Rationale:** A single binary eliminates deployment complexity. There are
 no plugins to install, no versions to align, no ClassNotFoundExceptions.
-The stripped binary is ~22 MB; the Alpine Docker image is ~31 MB. The
-trade-off is that unused formats still occupy binary space — mitigated
-by Cargo features for compile-time exclusion if needed.
+The stripped binary is ~28 MB with the `release-official` profile (fat LTO,
+`codegen-units = 1`) that the Dockerfile builds, and ~33 MB with the default
+`release` profile (thin LTO, `codegen-units = 4`); the default `cargo build`
+debug binary is ~56 MB, with a separate ~330 MB PDB on Windows — compare
+release artifacts with release, not with debug. The Alpine Docker image adds
+~8–10 MB. The trade-off is that unused formats still occupy binary space —
+mitigated by Cargo features for compile-time exclusion if needed.
 
 ### ADR-2: Filesystem as Source of Truth
 
@@ -420,6 +424,27 @@ PUT because it's a plain file store with no versioning scheme. Other formats
 already have protocol-defined immutability. Adding ETag/If-Match to Maven or
 npm would conflict with their publish APIs. The per-protocol approach follows
 ADR-4: each handler owns its full request lifecycle.
+
+### ADR-10: Configuration Reload is a Whitelist over a Leaked Snapshot
+
+**Decision:** A reload (`SIGHUP`, `POST /api/v1/admin/reload`, or the settings
+page's button) re-reads `config.toml`, builds one complete `Config` from the
+running one with only the reloadable fields replaced, and swaps it in through a
+pointer. Handlers keep reading `state.config` unchanged.
+
+**Context:** Most settings are read per request (`public_url`, upstreams,
+proxies, timeouts, TTLs, curation), but auth providers, storage, TLS, listener
+limits, rate limiters, the scheduler and the digest-quarantine store are built
+once at start. A whole-file swap would silently install values those objects
+never see.
+
+**Rationale:** The whitelist (upstream/proxy settings plus `public_url` and
+curation) is applied; every other changed key is reported as needing a restart.
+A reload fails closed: an unparsable file, an invalid value, or an allowlist
+that no longer parses leaves the previous configuration and curation engine in
+place. Requests may hold `&Config` across an await while a reload runs, so each
+replaced configuration is intentionally leaked — it is small, reloads are
+operator-triggered, and this avoids a per-request guard on every read.
 
 ## Adding a New Registry
 

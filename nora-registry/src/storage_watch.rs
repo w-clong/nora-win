@@ -65,13 +65,16 @@ fn prefix_registry(prefix: &str) -> Option<RegistryType> {
 /// - deb: `Packages`, `Packages.gz`, `Release`, `Release.gpg`, `InRelease`,
 ///   `dists/...`, `.nora-meta/...` — none end in `.deb`.
 /// - rpm: `repodata/...` — excluded by the segment check; `.nora-meta/...`
-///   sidecars do not end in `.rpm`.
+///   sidecars do not end in `.rpm`. Operator-supplied auxiliary metadata
+///   (`.nora-aux/modules.yaml`, `comps.xml`, `updateinfo.xml`) *is* watched:
+///   an external reposync may drop it, and it must trigger a repomd rebuild.
 /// - raw: every file under `raw/` is user data.
 fn is_watched_artifact(key: &str) -> bool {
     if let Some(rest) = key.strip_prefix("deb/") {
         rest.to_ascii_lowercase().ends_with(".deb")
     } else if let Some(rest) = key.strip_prefix("rpm/") {
-        rest.to_ascii_lowercase().ends_with(".rpm") && !rest.split('/').any(|s| s == "repodata")
+        (rest.to_ascii_lowercase().ends_with(".rpm") && !rest.split('/').any(|s| s == "repodata"))
+            || rpm::is_aux_key(key)
     } else {
         key.starts_with("raw/")
     }
@@ -411,6 +414,11 @@ mod tests {
         assert!(is_watched_artifact("rpm/myrepo/foo-1.0-1.x86_64.rpm"));
         assert!(!is_watched_artifact("rpm/myrepo/repodata/repomd.xml"));
         assert!(!is_watched_artifact("rpm/myrepo/.nora-meta/foo.json"));
+        assert!(is_watched_artifact("rpm/myrepo/.nora-aux/modules.yaml"));
+        assert!(is_watched_artifact("rpm/myrepo/.nora-aux/comps.xml"));
+        assert!(is_watched_artifact("rpm/myrepo/.nora-aux/updateinfo.xml"));
+        assert!(!is_watched_artifact("rpm/myrepo/.nora-aux/notes.txt"));
+        assert!(!is_watched_artifact("rpm/.nora-aux/modules.yaml"));
         assert!(is_watched_artifact("raw/notes.txt"));
         assert!(is_watched_artifact("raw/sub/dir/data.bin"));
         assert!(!is_watched_artifact("npm/lodash/tarballs/lodash.tgz"));
@@ -452,6 +460,20 @@ mod tests {
             &BTreeSet::from(["b".to_string()])
         );
         assert!(!changed.contains_key(&RegistryType::Raw)); // raw/f unchanged
+
+        // An auxiliary metadata drop maps to its repository, so a repomd
+        // rebuild runs without the operator calling /-/reindex.
+        let prev3 = fp(&[("rpm/b/two.rpm", 20, 2)]);
+        let now3 = fp(&[
+            ("rpm/b/two.rpm", 20, 2),
+            ("rpm/b/.nora-aux/modules.yaml", 40, 5),
+        ]);
+        assert_eq!(
+            changed_repos(&prev3, &now3)
+                .get(&RegistryType::Rpm)
+                .unwrap(),
+            &BTreeSet::from(["b".to_string()])
+        );
 
         // A modified package is also a change.
         let prev2 = fp(&[("deb/a/one.deb", 10, 1)]);

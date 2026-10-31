@@ -292,6 +292,31 @@ impl CurationConfig {
         settings
     }
 
+    /// Apply the reloadable curation settings of `loaded` to this startup config, keeping the
+    /// digest quarantine — global and per registry — exactly as NORA started with it.
+    ///
+    /// The quarantine decides whether the store of first-seen digests is loaded at start, so
+    /// a reload cannot change it: those keys stay the startup ones and a reload reports them
+    /// as waiting for a restart.
+    pub(crate) fn apply_reloadable_from(&mut self, loaded: &CurationConfig) {
+        let startup = self.clone();
+        *self = loaded.clone();
+        self.quarantine = startup.quarantine;
+        self.quarantine_ttl = startup.quarantine_ttl;
+        macro_rules! keep_quarantine {
+            ($($section:ident),* $(,)?) => {
+                $(
+                    self.$section.quarantine = startup.$section.quarantine;
+                    self.$section.quarantine_ttl = startup.$section.quarantine_ttl.clone();
+                )*
+            };
+        }
+        keep_quarantine!(
+            npm, pypi, cargo, go, docker, maven, gems, terraform, ansible, nuget, pub_dart, conan,
+            rpm, deb, cpan,
+        );
+    }
+
     /// Test-only: [`Self::registry_override`] to change, for tests that set a section of every
     /// registry in turn.
     #[cfg(test)]

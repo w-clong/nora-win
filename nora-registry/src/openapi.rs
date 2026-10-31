@@ -125,6 +125,9 @@ use crate::AppState;
         crate::openapi::rpm_delete,
         crate::openapi::rpm_pubkey,
         crate::openapi::rpm_reindex,
+        crate::openapi::rpm_metadata_put,
+        crate::openapi::rpm_metadata_delete,
+        crate::openapi::rpm_metadata_list,
         // Debian (APT)
         crate::openapi::deb_release,
         crate::openapi::deb_dist_release,
@@ -147,6 +150,7 @@ use crate::AppState;
         crate::openapi::revoke_token,
         // Admin
         crate::openapi::admin_reindex,
+        crate::openapi::admin_reload,
     ),
     components(
         schemas(
@@ -1134,6 +1138,59 @@ pub async fn rpm_pubkey() {}
 )]
 pub async fn rpm_reindex() {}
 
+/// Store module streams (`modules.yaml`), comps (`comps.xml`) or updateinfo
+/// (`updateinfo.xml`) for a hosted repository and regenerate its repodata
+#[utoipa::path(
+    put,
+    path = "/rpm/{repo}/-/metadata/{kind}",
+    tag = "rpm",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+        ("kind" = String, Path, description = "modules, comps or updateinfo")
+    ),
+    request_body(content = String, description = "Raw document, or gzip-compressed (detected by magic bytes)"),
+    responses(
+        (status = 201, description = "Stored; repodata regenerated with the new entry"),
+        (status = 400, description = "Invalid repository name, kind or document"),
+        (status = 413, description = "Document exceeds rpm.max_file_size"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn rpm_metadata_put() {}
+
+/// Remove an auxiliary metadata document and its repomd entry
+#[utoipa::path(
+    delete,
+    path = "/rpm/{repo}/-/metadata/{kind}",
+    tag = "rpm",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+        ("kind" = String, Path, description = "modules, comps or updateinfo")
+    ),
+    responses(
+        (status = 204, description = "Removed; repodata regenerated"),
+        (status = 404, description = "No such document"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn rpm_metadata_delete() {}
+
+/// List the auxiliary metadata documents a hosted repository stores
+#[utoipa::path(
+    get,
+    path = "/rpm/{repo}/-/metadata",
+    tag = "rpm",
+    params(
+        ("repo" = String, Path, description = "Repository name")
+    ),
+    responses(
+        (status = 200, description = "JSON list of kind, file, size and repomd type"),
+        (status = 400, description = "Invalid repository name"),
+        (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
+    )
+)]
+pub async fn rpm_metadata_list() {}
+
 // -------------------- Debian (APT) --------------------
 
 /// Repository index metadata (apt entry point for a flat repo)
@@ -1431,6 +1488,28 @@ pub async fn revoke_token() {}
     )
 )]
 pub async fn admin_reindex() {}
+
+/// Re-read the configuration file and apply its reloadable settings (admin only)
+///
+/// Applies `server.public_url`, registry upstreams/proxies/timeouts/TTLs and curation;
+/// auth, storage, TLS, listener limits, enabled registries and the digest quarantine keep
+/// their startup values and are listed under `restart_required` when the file changed
+/// them. An invalid file changes nothing. `dry_run=true` reports without installing.
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/reload",
+    tag = "admin",
+    params(
+        ("dry_run" = Option<bool>, Query, description = "Report what would change without applying it")
+    ),
+    responses(
+        (status = 200, description = "JSON: applied, restart_required and warnings"),
+        (status = 400, description = "The file does not parse or validate; nothing was changed", body = ErrorResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin role required")
+    )
+)]
+pub async fn admin_reload() {}
 
 // ============ Routes ============
 

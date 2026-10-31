@@ -1634,6 +1634,8 @@ impl Config {
             Some((path, content)) => {
                 let (config, unknown) = parse_config(&content)
                     .map_err(|e| format!("Invalid TOML in {}: {}", path, e))?;
+                refuse_hf_curation_keys(&path, &unknown)
+                    .map_err(|e| format!("Reload refused: {}", e))?;
                 surface_unknown_keys(&path, unknown, config_strict_from_env())
                     .map_err(|e| format!("Reload refused: {}", e))?;
                 config
@@ -1644,7 +1646,18 @@ impl Config {
         // As in `load`: validation judges the registries the enable-set mounts (#1098).
         let set = config.enabled_registries_quiet();
         config.apply_enabled_registries(&set);
-        let (_, errors) = config.validate();
+        // The same autofill `checked()` does at start, so a reload of a file that omits
+        // `public_url` does not clear the URL the server has been publishing.
+        if config.server.public_url.is_none() {
+            config.server.public_url = Some(format!(
+                "http://{}:{}",
+                config.server.host, config.server.port
+            ));
+        }
+        let (warnings, errors) = config.validate();
+        for w in &warnings {
+            tracing::warn!("Config validation: {}", w);
+        }
         if !errors.is_empty() {
             return Err(format!("Validation errors: {}", errors.join("; ")));
         }

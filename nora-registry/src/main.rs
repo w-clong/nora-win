@@ -377,10 +377,48 @@ pub struct ReloadableConfig {
     pub bypass_token: Option<ProtectedString>,
 }
 
+/// The configuration handlers read, replaceable while the server runs.
+///
+/// A reload builds one complete [`Config`] (startup values with the hot fields of the
+/// file applied) and swaps it in: a request sees either the old configuration or the new
+/// one, never a mix. Readers hold `&Config` for the length of a request while a reload may
+/// run, so every replaced configuration is intentionally leaked — it must outlive the last
+/// reader, and there is no way to know when that is without per-request guards. Reloads are
+/// operator-triggered and rare, and one configuration is small, so the memory this keeps is
+/// bounded by how often an operator clicks reload (or sends SIGHUP).
+pub struct LiveConfig {
+    current: RwLock<&'static Config>,
+}
+
+impl LiveConfig {
+    pub(crate) fn new(config: Config) -> Arc<Self> {
+        Arc::new(Self {
+            current: RwLock::new(Box::leak(Box::new(config))),
+        })
+    }
+
+    pub(crate) fn replace(&self, config: Config) {
+        *self.current.write() = Box::leak(Box::new(config));
+    }
+}
+
+impl std::ops::Deref for LiveConfig {
+    type Target = Config;
+
+    fn deref(&self) -> &Config {
+        // A `&'static Config` coerces to the borrow of `self`; the value behind it is
+        // never freed (see the type's comment).
+        *self.current.read()
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Storage,
-    pub config: Arc<Config>,
+    /// The live configuration: a reload replaces it atomically. Startup-bound settings
+    /// (auth, storage, TLS, ports, enabled registries, the quarantine) keep their startup
+    /// values inside it.
+    pub config: Arc<LiveConfig>,
     pub enabled_registries: Arc<HashSet<RegistryType>>,
     pub start_time: Instant,
     pub startup_duration_ms: u64,
@@ -422,8 +460,9 @@ pub struct AppState {
     pub digest_store: Arc<digest_quarantine::DigestStore>,
     /// Repository index signer (rpm/deb). `None` = indexes are unsigned.
     pub signer: Option<Arc<signing::RepoSigner>>,
-    /// Pre-compiled upstream hostname searchers for leak detection (#386)
-    pub leak_finders: metrics::LeakFinders,
+    /// Pre-compiled upstream hostname searchers for leak detection (#386). Rebuilt on
+    /// reload, because the upstream lists it scans for can change.
+    pub leak_finders: Arc<ArcSwap<metrics::LeakFinders>>,
     /// Shared shutdown signal so on-demand background tasks (e.g. the admin
     /// reindex warm-up) stop promptly on SIGTERM/SIGINT (#306).
     pub cancel_token: tokio_util::sync::CancellationToken,
@@ -442,6 +481,11 @@ impl AppState {
     /// Load a snapshot of the current curation engine (lock-free read via ArcSwap).
     pub fn curation(&self) -> arc_swap::Guard<Arc<ReloadableConfig>> {
         self.reloadable.load()
+    }
+
+    /// The leak-detection matchers of the current configuration.
+    pub fn leak_finders(&self) -> arc_swap::Guard<Arc<metrics::LeakFinders>> {
+        self.leak_finders.load()
     }
 
     /// Shorthand for the curation bypass token from the reloadable config.
@@ -3470,7 +3514,9 @@ async fn run_server(mut config: Config, storage: Storage) {
         bypass_token,
     }));
 
-    let leak_finders = metrics::LeakFinders::new(config.upstream_hostnames());
+    let leak_finders = Arc::new(ArcSwap::from_pointee(metrics::LeakFinders::new(
+        config.upstream_hostnames(),
+    )));
 
     let enabled_registries = Arc::new(enabled_registries);
     // Cancellation token for graceful shutdown of background tasks (#306). Created
@@ -3482,7 +3528,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     let (tasks, maintenance) = supervision(&config.server);
     let state = AppState {
         storage,
-        config: Arc::new(config),
+        config: LiveConfig::new(config),
         enabled_registries,
         start_time,
         startup_duration_ms,
@@ -3795,23 +3841,22 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     spawn_maintenance(&state, MAINTENANCE_PERIOD);
 
-    // SIGHUP handler: hot-reload curation policy
+    // SIGHUP handler: hot-reload curation policy and upstream configuration
     #[cfg(unix)]
     {
-        let slot = state.reloadable.clone();
-        let held = Arc::new(HeldQuarantine::of(&state.config.curation));
+        let signal_state = state.clone();
         state.tasks.spawn("sighup", move || {
-            let (slot, held) = (slot.clone(), held.clone());
+            let state = signal_state.clone();
             async move {
                 let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())
                     .expect("Failed to install SIGHUP handler");
                 loop {
                     sighup.recv().await;
-                    info!("SIGHUP received — reloading curation policy");
-                    match reload_curation(&slot, &held, Config::path_from_env()) {
-                        Ok(()) => info!("Curation policy reloaded successfully"),
+                    info!("SIGHUP received — reloading configuration");
+                    match reload_config(&state, Config::path_from_env(), false) {
+                        Ok(_) => info!("Curation policy reloaded successfully"),
                         Err(e) => {
-                            error!(error = %e, "Curation policy reload failed, keeping previous config")
+                            error!(error = %e, "Configuration reload failed, keeping previous config")
                         }
                     }
                 }
@@ -5107,6 +5152,187 @@ fn reload_curation(
     Ok(())
 }
 
+/// What a configuration reload applied, what still waits for a restart, and the
+/// validation warnings of the file it read.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ReloadOutcome {
+    /// Config keys (as config.toml spells them) whose new value is live.
+    pub applied: Vec<String>,
+    /// Config keys the file changed that need a restart to take effect.
+    pub restart_required: Vec<String>,
+    /// Validation warnings of the file that was read.
+    pub warnings: Vec<String>,
+}
+
+/// Copy the settings a reload may change from `loaded` into `effective`, which starts
+/// as the live configuration: `public_url`, every registry's upstream/proxy settings,
+/// and curation (except the digest quarantine).
+///
+/// Everything else — auth, storage, TLS, ports, rate limits, enabled registries, gc,
+/// retention, watch, signing, audit, circuit breaker, the quarantine — is backed by an
+/// object built at start, so it keeps its startup value; the reload reports those keys
+/// as waiting for a restart.
+fn apply_reloadable_config(effective: &mut Config, loaded: &Config) {
+    effective
+        .server
+        .public_url
+        .clone_from(&loaded.server.public_url);
+
+    /// Replace a registry section with the file's, keeping the startup `enabled` flag
+    /// (the mounted routes and `enabled_registries` are startup-bound).
+    macro_rules! copy_section {
+        ($section:ident) => {{
+            let enabled = effective.$section.enabled;
+            effective.$section = loaded.$section.clone();
+            effective.$section.enabled = enabled;
+        }};
+    }
+
+    copy_section!(docker);
+    copy_section!(maven);
+    copy_section!(pypi);
+    copy_section!(go);
+    copy_section!(raw);
+    copy_section!(gems);
+    copy_section!(terraform);
+    copy_section!(ansible);
+    copy_section!(pub_dart);
+    copy_section!(conan);
+    copy_section!(rpm);
+    copy_section!(deb);
+    copy_section!(cpan);
+    copy_section!(hf);
+
+    // `import_embedded` is read once, at start, when the embedded registry files are
+    // imported; a change to it must not be reported as applied.
+    let npm_import = effective.npm.import_embedded.clone();
+    copy_section!(npm);
+    effective.npm.import_embedded = npm_import;
+
+    let cargo_import = effective.cargo.import_embedded.clone();
+    copy_section!(cargo);
+    effective.cargo.import_embedded = cargo_import;
+
+    // NuGet's search endpoints are auto-discovered at start when the file leaves them
+    // empty; an empty value in the file must not undo that discovery.
+    let search = effective.nuget.search_service.clone();
+    let autocomplete = effective.nuget.autocomplete.clone();
+    copy_section!(nuget);
+    if effective.nuget.search_service.trim().is_empty() {
+        effective.nuget.search_service = search;
+    }
+    if effective.nuget.autocomplete.trim().is_empty() {
+        effective.nuget.autocomplete = autocomplete;
+    }
+
+    effective.curation.apply_reloadable_from(&loaded.curation);
+}
+
+/// Every leaf of a configuration as `path -> value`, for comparing two configurations
+/// without naming their keys by hand.
+fn config_leaf_paths(config: &Config) -> std::collections::BTreeMap<String, String> {
+    fn walk(
+        value: &serde_json::Value,
+        prefix: &str,
+        out: &mut std::collections::BTreeMap<String, String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    walk(child, &path, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    walk(child, &format!("{prefix}[{index}]"), out);
+                }
+            }
+            other => {
+                out.insert(prefix.to_string(), other.to_string());
+            }
+        }
+    }
+
+    let mut out = std::collections::BTreeMap::new();
+    if let Ok(value) = serde_json::to_value(config) {
+        walk(&value, "", &mut out);
+    }
+    out
+}
+
+/// The leaf paths whose value differs between two configurations.
+fn changed_config_paths(old: &Config, new: &Config) -> Vec<String> {
+    let old = config_leaf_paths(old);
+    let new = config_leaf_paths(new);
+    let mut paths: Vec<String> = old
+        .keys()
+        .chain(new.keys())
+        .filter(|path| old.get(*path) != new.get(*path))
+        .cloned()
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Re-read the configuration file, apply its reloadable settings to the running
+/// server, and report what changed.
+///
+/// Fail-closed: a file that does not parse or validate, or whose curation allowlist /
+/// blocklist no longer parses, returns `Err` and leaves both the live configuration and
+/// the curation engine exactly as they were. `dry_run` performs every check and builds
+/// the same outcome without installing anything.
+pub fn reload_config(
+    state: &AppState,
+    path: Option<String>,
+    dry_run: bool,
+) -> Result<ReloadOutcome, String> {
+    let loaded = Config::try_load_from(path)?;
+    // Fail-closed before anything is swapped: in enforce mode a filter that no longer
+    // parses must keep the previous engine, never become allow-all (#586).
+    let engine = build_curation_engine(&loaded)?;
+
+    let current = (*state.config).clone();
+    let mut effective = current.clone();
+    apply_reloadable_config(&mut effective, &loaded);
+
+    let warnings = loaded.validate().0;
+    let changed = changed_config_paths(&current, &loaded);
+    let not_applied: HashSet<String> = changed_config_paths(&effective, &loaded)
+        .into_iter()
+        .collect();
+    let (restart_required, applied): (Vec<String>, Vec<String>) = changed
+        .into_iter()
+        .partition(|path| not_applied.contains(path));
+
+    if !dry_run {
+        let leak_finders = metrics::LeakFinders::new(effective.upstream_hostnames());
+        state.config.replace(effective);
+        state.reloadable.store(Arc::new(ReloadableConfig {
+            curation_engine: engine,
+            bypass_token: loaded.curation.bypass_token,
+        }));
+        state.leak_finders.store(Arc::new(leak_finders));
+    }
+
+    if !restart_required.is_empty() {
+        warn!(
+            keys = ?restart_required,
+            "Changed keys are not applied by a reload; they apply after a restart"
+        );
+    }
+    Ok(ReloadOutcome {
+        applied,
+        restart_required,
+        warnings,
+    })
+}
+
 /// Build a CurationEngine from the given config (used at startup and reload).
 ///
 /// Fail-closed in enforce mode: if a configured filter fails to parse, this
@@ -5695,6 +5921,117 @@ mod curation_reload_tests {
             .load()
             .curation_engine
             .reads_release_date(RegistryType::Npm));
+    }
+}
+
+/// The reload a SIGHUP (and the settings page) runs: what it applies, what waits for a
+/// restart, and that a bad file changes nothing.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod config_reload_tests {
+    use super::reload_config;
+    use crate::digest_quarantine::QuarantineMode;
+
+    #[test]
+    fn public_url_and_upstreams_apply_without_a_restart() {
+        let ctx = crate::test_helpers::create_test_context();
+        let _lock = crate::test_env::env_lock();
+        let (_dir, file) = crate::test_helpers::reload_file(&ctx, |config| {
+            config.server.public_url = Some("http://new.example:4000".to_string());
+            config.npm.proxy = Some("http://npm.example".to_string());
+        });
+
+        let outcome = reload_config(&ctx.state, Some(file), false).expect("reload succeeds");
+
+        assert_eq!(
+            ctx.state.config.server.public_url.as_deref(),
+            Some("http://new.example:4000")
+        );
+        assert_eq!(
+            ctx.state.config.npm.proxy.as_deref(),
+            Some("http://npm.example")
+        );
+        for key in ["server.public_url", "npm.proxy"] {
+            assert!(
+                outcome.applied.iter().any(|path| path == key),
+                "{key} not applied: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_bound_keys_are_reported_and_keep_their_values() {
+        let ctx = crate::test_helpers::create_test_context();
+        let _lock = crate::test_env::env_lock();
+        let before = ctx.state.config.server.body_limit_mb;
+        let (_dir, file) = crate::test_helpers::reload_file(&ctx, |config| {
+            config.server.body_limit_mb = before + 1;
+        });
+
+        let outcome = reload_config(&ctx.state, Some(file), false).expect("reload succeeds");
+
+        assert!(
+            outcome
+                .restart_required
+                .iter()
+                .any(|path| path == "server.body_limit_mb"),
+            "the changed startup key must wait for a restart: {outcome:?}"
+        );
+        assert_eq!(ctx.state.config.server.body_limit_mb, before);
+    }
+
+    #[test]
+    fn the_digest_quarantine_still_waits_for_a_restart() {
+        let ctx = crate::test_helpers::create_test_context();
+        let _lock = crate::test_env::env_lock();
+        let before = ctx.state.config.curation.quarantine.clone();
+        let (_dir, file) = crate::test_helpers::reload_file(&ctx, |config| {
+            config.curation.quarantine = Some(QuarantineMode::Observe);
+        });
+
+        let outcome = reload_config(&ctx.state, Some(file), false).expect("reload succeeds");
+
+        assert!(
+            outcome
+                .restart_required
+                .iter()
+                .any(|path| path == "curation.quarantine"),
+            "the quarantine is start-bound: {outcome:?}"
+        );
+        assert_eq!(ctx.state.config.curation.quarantine, before);
+    }
+
+    #[test]
+    fn an_invalid_file_changes_nothing() {
+        let ctx = crate::test_helpers::create_test_context();
+        let _lock = crate::test_env::env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[server\nport = 1\n").unwrap();
+        let before = ctx.state.config.server.public_url.clone();
+
+        assert!(
+            reload_config(&ctx.state, Some(path.to_string_lossy().into_owned()), false).is_err()
+        );
+        assert_eq!(ctx.state.config.server.public_url, before);
+    }
+
+    #[test]
+    fn a_dry_run_reports_without_installing() {
+        let ctx = crate::test_helpers::create_test_context();
+        let _lock = crate::test_env::env_lock();
+        let before = ctx.state.config.server.public_url.clone();
+        let (_dir, file) = crate::test_helpers::reload_file(&ctx, |config| {
+            config.server.public_url = Some("http://dry.example:4000".to_string());
+        });
+
+        let outcome = reload_config(&ctx.state, Some(file), true).expect("dry run succeeds");
+
+        assert!(outcome
+            .applied
+            .iter()
+            .any(|path| path == "server.public_url"));
+        assert_eq!(ctx.state.config.server.public_url, before);
     }
 }
 

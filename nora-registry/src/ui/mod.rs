@@ -184,6 +184,9 @@ pub fn routes() -> Router<AppState> {
         .route("/ui/terraform/{name}", get(generic_registry_detail))
         // Token management UI (protected by auth middleware)
         .route("/ui/tokens", get(tokens_page))
+        // Configuration reload UI (always gated when auth is enabled)
+        .route("/ui/settings", get(settings_page))
+        .route("/api/ui/settings/reload", post(settings_reload))
         // Token management API (HTMX endpoints)
         .route("/api/ui/tokens/create", post(tokens_create))
         .route("/api/ui/tokens/list", get(tokens_list))
@@ -1305,6 +1308,109 @@ async fn tokens_revoke(
     }
 }
 
+// ==================== Settings Handlers ====================
+
+/// Who may read the settings page and trigger a reload.
+///
+/// With auth disabled the UI is already open to anyone who can reach the port (and such
+/// a deployment accepts writes from them), so the page is open too. With auth enabled,
+/// the settings routes are excluded from the anonymous web surface by the auth
+/// middleware; here an admin token, or a Basic-auth account listed in
+/// `auth.admin_users`, may use it. A plain Basic (Write) account may not.
+fn may_manage_settings(
+    state: &AppState,
+    user: Option<&Extension<AuthenticatedUser>>,
+    role: Option<&Extension<AuthenticatedRole>>,
+) -> bool {
+    if !state.config.auth.enabled {
+        return true;
+    }
+    if role.is_some_and(|Extension(role)| role.0.can_admin()) {
+        return true;
+    }
+    user.is_some_and(|Extension(user)| {
+        state
+            .config
+            .auth
+            .admin_users
+            .iter()
+            .any(|name| name == &user.0)
+    })
+}
+
+/// The full gate of the settings routes: a namespace-scoped identity may not reload the
+/// global configuration, whatever its role.
+fn may_reload_settings(
+    state: &AppState,
+    user: Option<&Extension<AuthenticatedUser>>,
+    role: Option<&Extension<AuthenticatedRole>>,
+    authority: Option<&Extension<NamespaceAuthority>>,
+) -> bool {
+    if authority.is_some_and(|Extension(authority)| authority.is_scoped()) {
+        return false;
+    }
+    may_manage_settings(state, user, role)
+}
+
+/// Settings page (GET /ui/settings): public_url, the file a reload reads, and the button.
+async fn settings_page(
+    State(state): State<AppState>,
+    user: Option<Extension<AuthenticatedUser>>,
+    role: Option<Extension<AuthenticatedRole>>,
+    authority: Option<Extension<NamespaceAuthority>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !may_reload_settings(&state, user.as_ref(), role.as_ref(), authority.as_ref()) {
+        return (StatusCode::FORBIDDEN, Html("Forbidden".to_string())).into_response();
+    }
+    let lang = extract_lang_from_headers(&headers);
+    let public_url = state.config.server.public_url.as_deref().unwrap_or("");
+    let config_path =
+        crate::config::Config::path_from_env().unwrap_or_else(|| "config.toml".to_string());
+    Html(render_settings_page(
+        public_url,
+        &config_path,
+        lang,
+        state.config.auth.enabled,
+    ))
+    .into_response()
+}
+
+/// Reload the configuration (POST /api/ui/settings/reload).
+///
+/// Same CSRF guard as token creation (HTMX sets `HX-Request`): a cross-site form post
+/// cannot reach it. The reload itself is fail-closed — on an invalid file nothing is
+/// swapped.
+async fn settings_reload(
+    State(state): State<AppState>,
+    user: Option<Extension<AuthenticatedUser>>,
+    role: Option<Extension<AuthenticatedRole>>,
+    authority: Option<Extension<NamespaceAuthority>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if headers.get("hx-request").is_none() {
+        return (StatusCode::FORBIDDEN, Html("Forbidden".to_string())).into_response();
+    }
+    if !may_reload_settings(&state, user.as_ref(), role.as_ref(), authority.as_ref()) {
+        return (StatusCode::FORBIDDEN, Html("Forbidden".to_string())).into_response();
+    }
+    let lang = extract_lang_from_headers(&headers);
+    match crate::reload_config(&state, crate::config::Config::path_from_env(), false) {
+        Ok(outcome) => {
+            let actor = user
+                .as_ref()
+                .map(|Extension(user)| user.0.as_str())
+                .unwrap_or("anonymous");
+            state.audit.log(crate::audit::AuditEntry::new(
+                "reload", actor, "", "config", "",
+            ));
+            state.ui_events.notify_changed();
+            (StatusCode::OK, Html(render_reload_result(&outcome, lang))).into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, Html(render_reload_error(&error))).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod base_path_tests {
     use super::*;
@@ -1423,5 +1529,109 @@ mod base_path_tests {
         assert!(UiMintRefusal::ScopedCannotMintUnrestricted
             .message()
             .contains("scoped"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod settings_tests {
+    use super::*;
+    use crate::tokens::Role;
+    use axum::http::Method;
+
+    fn state_with_auth(admin_users: Vec<String>) -> crate::test_helpers::TestContext {
+        let ctx = crate::test_helpers::create_test_context();
+        let mut config = (*ctx.state.config).clone();
+        config.auth.enabled = true;
+        config.auth.admin_users = admin_users;
+        ctx.state.config.replace(config);
+        ctx
+    }
+
+    #[test]
+    fn settings_authority_matrix() {
+        let ctx = crate::test_helpers::create_test_context();
+        // Auth disabled: the deployment already accepts writes from anyone who reaches it.
+        assert!(may_manage_settings(&ctx.state, None, None));
+        assert!(may_manage_settings(
+            &ctx.state,
+            Some(&Extension(AuthenticatedUser("anonymous".into()))),
+            None
+        ));
+
+        let ctx = state_with_auth(vec!["bob".into()]);
+        let admin = AuthenticatedRole(Role::Admin);
+        let write = AuthenticatedRole(Role::Write);
+        let bob = AuthenticatedUser("bob".into());
+        let alice = AuthenticatedUser("alice".into());
+
+        assert!(may_manage_settings(
+            &ctx.state,
+            Some(&Extension(alice.clone())),
+            Some(&Extension(admin))
+        ));
+        // A Basic account in auth.admin_users may reload even though Basic is Write-only.
+        assert!(may_manage_settings(
+            &ctx.state,
+            Some(&Extension(bob)),
+            Some(&Extension(write.clone()))
+        ));
+        // Any other Basic account may not.
+        assert!(!may_manage_settings(
+            &ctx.state,
+            Some(&Extension(alice)),
+            Some(&Extension(write.clone()))
+        ));
+    }
+
+    #[tokio::test]
+    async fn settings_routes_are_gated_when_auth_is_on() {
+        let ctx = state_with_auth(Vec::new());
+        let mut config = (*ctx.state.config).clone();
+        // Even an explicitly public web UI must not open the settings routes.
+        config.auth.public_web_ui = true;
+        config.auth.anonymous_read = true;
+        ctx.state.config.replace(config);
+
+        let resp = crate::test_helpers::send(&ctx.app, Method::GET, "/ui/settings", "").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp =
+            crate::test_helpers::send(&ctx.app, Method::POST, "/api/ui/settings/reload", "").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn reload_needs_the_htmx_header() {
+        let ctx = crate::test_helpers::create_test_context();
+        let resp =
+            crate::test_helpers::send(&ctx.app, Method::POST, "/api/ui/settings/reload", "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    // The lock is held across the request on purpose: the reload reads process env, and no
+    // other test may change it during that read.
+    #[allow(clippy::await_holding_lock)]
+    async fn the_button_endpoint_reloads_and_reports() {
+        // The reload applies env overrides and reads process env; no other test may change
+        // them meanwhile.
+        let _env = crate::test_env::env_lock();
+        let ctx = crate::test_helpers::create_test_context();
+        // No NORA_CONFIG_PATH in tests and no config.toml here: the reload reads defaults.
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/settings/reload",
+            vec![("hx-request", "true")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = crate::test_helpers::body_bytes(resp).await;
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("settings") || body.contains("Applied") || body.contains("configured"),
+            "unexpected fragment: {body}"
+        );
     }
 }

@@ -2628,3 +2628,133 @@ pub fn render_uploader_panel() -> String {
     .to_string()
 }
 //（注：内容由AI生成）
+
+// ==================== Settings Page ====================
+
+/// Renders the settings page: the values a reload can change, and the button that
+/// re-reads the configuration file.
+pub fn render_settings_page(
+    public_url: &str,
+    config_path: &str,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    let t = get_translations(lang);
+    let content = format!(
+        r##"
+        <div class="mb-6">
+            <h1 class="text-2xl font-bold text-slate-200 mb-1">{title}</h1>
+            <p class="text-slate-400">{subtitle}</p>
+        </div>
+
+        <div class="bg-[#1e293b] rounded-lg border border-slate-700 p-6">
+            <dl class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                <div>
+                    <dt class="text-sm font-medium text-slate-400 mb-1">{public_url_label}</dt>
+                    <dd class="font-mono text-slate-200 break-all">{public_url}</dd>
+                </div>
+                <div>
+                    <dt class="text-sm font-medium text-slate-400 mb-1">{config_file_label}</dt>
+                    <dd class="font-mono text-slate-200 break-all">{config_path}</dd>
+                </div>
+            </dl>
+            <p class="text-sm text-slate-400 mb-4">{hint}</p>
+            <form hx-post="/api/ui/settings/reload"
+                  hx-target="#settings-result"
+                  hx-swap="innerHTML"
+                  hx-disabled-elt="find button">
+                <button type="submit"
+                        class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition-colors">
+                    {reload}
+                </button>
+            </form>
+            <div id="settings-result" class="mt-4"></div>
+        </div>
+    "##,
+        title = html_escape(t.settings_title),
+        subtitle = html_escape(t.settings_subtitle),
+        public_url_label = html_escape(t.settings_public_url),
+        config_file_label = html_escape(t.settings_config_file),
+        public_url = html_escape(public_url),
+        config_path = html_escape(config_path),
+        hint = html_escape(t.settings_reload_hint),
+        reload = html_escape(t.settings_reload),
+    );
+
+    layout_dark(
+        t.settings_title,
+        &content,
+        Some("settings"),
+        "",
+        lang,
+        auth_enabled,
+    )
+}
+
+/// Renders the HTMX fragment shown after a reload: what took effect, what waits for a
+/// restart, and the file's validation warnings.
+pub fn render_reload_result(outcome: &crate::ReloadOutcome, lang: Lang) -> String {
+    let t = get_translations(lang);
+    let list = |items: &[String]| -> String {
+        items
+            .iter()
+            .map(|path| {
+                format!(
+                    r##"<li class="font-mono text-sm">{}</li>"##,
+                    html_escape(path)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    let mut sections = String::new();
+    if !outcome.applied.is_empty() {
+        sections.push_str(&format!(
+            r##"<div class="bg-green-900/30 border border-green-700 rounded-lg p-4 mb-3">
+                <p class="text-green-400 font-medium mb-2">{}</p>
+                <ul class="space-y-1 text-slate-200">{}</ul>
+            </div>"##,
+            html_escape(t.settings_applied),
+            list(&outcome.applied)
+        ));
+    }
+    if !outcome.restart_required.is_empty() {
+        sections.push_str(&format!(
+            r##"<div class="bg-yellow-900/30 border border-yellow-700 rounded-lg p-4 mb-3">
+                <p class="text-yellow-400 font-medium mb-2">{}</p>
+                <ul class="space-y-1 text-slate-200">{}</ul>
+            </div>"##,
+            html_escape(t.settings_restart_required),
+            list(&outcome.restart_required)
+        ));
+    }
+    if !outcome.warnings.is_empty() {
+        sections.push_str(&format!(
+            r##"<div class="bg-yellow-900/30 border border-yellow-700 rounded-lg p-4 mb-3">
+                <ul class="space-y-1 text-slate-200">{}</ul>
+            </div>"##,
+            outcome
+                .warnings
+                .iter()
+                .map(|warning| format!(r##"<li class="text-sm">{}</li>"##, html_escape(warning)))
+                .collect::<Vec<_>>()
+                .join("")
+        ));
+    }
+    if sections.is_empty() {
+        sections = format!(
+            r##"<div class="bg-green-900/30 border border-green-700 rounded-lg p-4 text-green-400">{}</div>"##,
+            html_escape(t.settings_no_changes)
+        );
+    }
+    sections
+}
+
+/// Renders the error fragment of a refused reload (invalid TOML, validation, allowlist).
+pub fn render_reload_error(message: &str) -> String {
+    format!(
+        r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400 break-words">{}</div>"##,
+        html_escape(message)
+    )
+}

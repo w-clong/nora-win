@@ -210,6 +210,11 @@ fn is_web_surface(path: &str) -> bool {
     if path.starts_with("/ui/tokens") || path.starts_with("/api/ui/tokens") {
         return false;
     }
+    // Settings expose the running configuration and can rewrite it: always authenticated,
+    // never opened by `anonymous_read` / `public_web_ui`.
+    if path.starts_with("/ui/settings") || path.starts_with("/api/ui/settings") {
+        return false;
+    }
     path.starts_with("/ui") || path.starts_with("/api/ui") || path.starts_with("/api-docs")
 }
 
@@ -407,8 +412,13 @@ pub async fn auth_middleware(
             return next.run(request).await;
         }
         // A gated web-surface request without credentials gets a Basic
-        // challenge so browsers prompt instead of rendering a bare 401.
-        if (is_web_surface(path) || path == "/metrics")
+        // challenge so browsers prompt instead of rendering a bare 401. Settings is
+        // excluded from `is_web_surface` (it must never be opened anonymously), so
+        // name it here too.
+        if (is_web_surface(path)
+            || path.starts_with("/ui/settings")
+            || path.starts_with("/api/ui/settings")
+            || path == "/metrics")
             && request
                 .headers()
                 .get(axum::http::header::AUTHORIZATION)

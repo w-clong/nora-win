@@ -35,7 +35,7 @@ use flate2::write::GzEncoder;
 use rpm::PackageMetadata;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use std::io::Write;
+use std::io::{Read, Write};
 
 /// Dashboard index: group stored .rpm files by repository name.
 pub const INDEX_PATTERN: (&str, &str) = ("rpm/", ".rpm");
@@ -43,6 +43,13 @@ pub const INDEX_PATTERN: (&str, &str) = ("rpm/", ".rpm");
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/rpm/{repo}/-/reindex", axum::routing::post(reindex))
+        .route("/rpm/{repo}/-/metadata", get(list_metadata))
+        .route(
+            "/rpm/{repo}/-/metadata/{kind}",
+            axum::routing::put(put_metadata)
+                .delete(delete_metadata)
+                .fallback(|| async { method_not_allowed("PUT, DELETE") }),
+        )
         .route(
             "/rpm/{repo}/{*path}",
             get(download)
@@ -56,7 +63,144 @@ pub fn routes() -> Router<AppState> {
 /// Sidecar prefix inside a repo. Not a valid RPM path component for clients
 /// (uploads to it are rejected), so it can never collide with package files.
 const META_DIR: &str = ".nora-meta";
+/// Operator-supplied repodata documents (module streams, comps, updateinfo).
+/// Kept apart from [`META_DIR`] so the package-sidecar reader never tries to
+/// parse them as JSON.
+const AUX_DIR: &str = ".nora-aux";
 const REPODATA: &str = "repodata";
+
+/// Auxiliary metadata NORA can merge into a hosted repo's repomd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuxKind {
+    /// `modules.yaml` — Fedora/RHEL module streams (PHP, nodejs, ...).
+    Modules,
+    /// `comps.xml` — dnf group definitions.
+    Comps,
+    /// `updateinfo.xml` — advisory/errata data.
+    Updateinfo,
+}
+
+impl AuxKind {
+    const ALL: [AuxKind; 3] = [Self::Modules, Self::Comps, Self::Updateinfo];
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "modules" => Some(Self::Modules),
+            "comps" => Some(Self::Comps),
+            "updateinfo" => Some(Self::Updateinfo),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Modules => "modules",
+            Self::Comps => "comps",
+            Self::Updateinfo => "updateinfo",
+        }
+    }
+
+    fn filename(self) -> &'static str {
+        match self {
+            Self::Modules => "modules.yaml",
+            Self::Comps => "comps.xml",
+            Self::Updateinfo => "updateinfo.xml",
+        }
+    }
+
+    /// repomd `type=` attribute (createrepo_c's names: comps is served as
+    /// `group_gz`; `group` would be the uncompressed variant dnf does not need).
+    fn repomd_type(self) -> &'static str {
+        match self {
+            Self::Modules => "modules",
+            Self::Comps => "group_gz",
+            Self::Updateinfo => "updateinfo",
+        }
+    }
+
+    /// Extension of the generated blob: `<checksum>-<type>.<ext>.gz`.
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Modules => "yaml",
+            Self::Comps | Self::Updateinfo => "xml",
+        }
+    }
+
+    /// Cheap shape check so an operator typo fails at upload instead of
+    /// producing a repomd entry dnf cannot parse.
+    fn validate(self, text: &str) -> Result<(), &'static str> {
+        if text.trim().is_empty() {
+            return Err("Metadata document is empty");
+        }
+        let ok = match self {
+            Self::Modules => text
+                .lines()
+                .take(200)
+                .any(|line| line.trim_start().starts_with("document: modulemd")),
+            Self::Comps => text.contains("<comps"),
+            Self::Updateinfo => text.contains("<updates"),
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(match self {
+                Self::Modules => "modules metadata must be a modulemd YAML (document: modulemd)",
+                Self::Comps => "comps metadata must be a comps XML (<comps> root)",
+                Self::Updateinfo => "updateinfo metadata must be updateinfo XML (<updates> root)",
+            })
+        }
+    }
+}
+
+fn aux_key(repo: &str, kind: AuxKind) -> String {
+    format!("rpm/{repo}/{AUX_DIR}/{}", kind.filename())
+}
+
+/// Whether a storage key is an operator-supplied RPM metadata document.
+pub(crate) fn is_aux_key(key: &str) -> bool {
+    aux_kind_for_key(key).is_some()
+}
+
+/// Full storage key → auxiliary metadata kind, for the storage watcher.
+fn aux_kind_for_key(key: &str) -> Option<AuxKind> {
+    let rest = key.strip_prefix("rpm/")?;
+    let (repo, tail) = rest.split_once('/')?;
+    if repo.is_empty() {
+        return None;
+    }
+    let name = tail.strip_prefix(&format!("{AUX_DIR}/"))?;
+    AuxKind::ALL
+        .into_iter()
+        .find(|kind| kind.filename() == name)
+}
+
+/// A path segment starting with `.` is server-owned (`.nora-meta`,
+/// `.nora-aux`); clients may neither read nor write those.
+fn is_internal_path(path: &str) -> bool {
+    path.split('/').any(|seg| seg.starts_with('.'))
+}
+
+fn valid_repo_name(repo: &str) -> bool {
+    !repo.is_empty() && repo.is_ascii() && !repo.contains('/') && !repo.starts_with('.')
+}
+
+/// Metadata bodies may be sent raw or gzip-compressed (a gzip is detected by
+/// its magic bytes, not the request's Content-Encoding). Decompression is
+/// bounded so a small upload cannot expand without limit.
+fn decode_metadata(body: &[u8], max: u64) -> Result<Vec<u8>, &'static str> {
+    if !body.starts_with(&[0x1f, 0x8b]) {
+        return Ok(body.to_vec());
+    }
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(body)
+        .take(max.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|_| "Invalid gzip metadata body")?;
+    if out.len() as u64 > max {
+        return Err("Metadata too large after decompression");
+    }
+    Ok(out)
+}
 
 fn package_key(repo: &str, path: &str) -> String {
     format!("rpm/{repo}/{path}")
@@ -74,7 +218,7 @@ pub(crate) fn repomd_key(repo: &str) -> String {
 /// The storage-key wrapper re-validates centrally; this is edge defence with
 /// format-specific rules (single-segment repo, `.rpm` suffix, reserved dirs).
 fn validate_package_path(repo: &str, path: &str) -> Result<(), &'static str> {
-    if repo.is_empty() || !repo.is_ascii() || repo.contains('/') || repo.starts_with('.') {
+    if !valid_repo_name(repo) {
         return Err("Invalid repository name");
     }
     if !path.is_ascii() || path.contains("..") || path.contains('\0') || path.starts_with('/') {
@@ -537,18 +681,22 @@ struct RepodataFile {
     gz: Vec<u8>,
 }
 
-fn build_repodata_file(kind: &'static str, xml: &str) -> Result<RepodataFile, std::io::Error> {
+fn build_repodata_file(
+    kind: &'static str,
+    body: &str,
+    extension: &str,
+) -> Result<RepodataFile, std::io::Error> {
     let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(xml.as_bytes())?;
+    enc.write_all(body.as_bytes())?;
     let gz = enc.finish()?;
     let checksum = hex::encode(sha2::Sha256::digest(&gz));
     Ok(RepodataFile {
         kind,
-        href: format!("{REPODATA}/{checksum}-{kind}.xml.gz"),
+        href: format!("{REPODATA}/{checksum}-{kind}.{extension}.gz"),
         checksum,
-        open_checksum: hex::encode(sha2::Sha256::digest(xml.as_bytes())),
+        open_checksum: hex::encode(sha2::Sha256::digest(body.as_bytes())),
         size: gz.len(),
-        open_size: xml.len(),
+        open_size: body.len(),
         gz,
     })
 }
@@ -601,13 +749,31 @@ pub(crate) async fn regenerate_repodata(
     });
 
     let files = [
-        build_repodata_file("primary", &generate_primary_xml(&pkgs)),
-        build_repodata_file("filelists", &generate_filelists_xml(&pkgs)),
-        build_repodata_file("other", &generate_other_xml(&pkgs)),
+        build_repodata_file("primary", &generate_primary_xml(&pkgs), "xml"),
+        build_repodata_file("filelists", &generate_filelists_xml(&pkgs), "xml"),
+        build_repodata_file("other", &generate_other_xml(&pkgs), "xml"),
     ];
-    let mut built = Vec::with_capacity(3);
+    let mut built = Vec::with_capacity(6);
     for f in files {
         built.push(f.map_err(|e| format!("gzip repodata: {e}"))?);
+    }
+
+    // Operator-supplied module streams / comps / updateinfo. Missing documents
+    // simply omit their repomd entry; a read failure (other than NotFound) is
+    // fail-closed like the package sidecars above.
+    for kind in AuxKind::ALL {
+        match storage.get(&aux_key(repo, kind)).await {
+            Ok(bytes) => {
+                let text = std::str::from_utf8(&bytes)
+                    .map_err(|e| format!("{} is not UTF-8: {e}", kind.filename()))?;
+                built.push(
+                    build_repodata_file(kind.repomd_type(), text, kind.extension())
+                        .map_err(|e| format!("gzip {}: {e}", kind.name()))?,
+                );
+            }
+            Err(crate::storage::StorageError::NotFound) => {}
+            Err(e) => return Err(format!("read {} metadata: {e}", kind.name())),
+        }
     }
 
     let revision = std::time::SystemTime::now()
@@ -818,7 +984,7 @@ async fn download(
     // configured upstream. Packages are immutable; metadata is TTL-bounded.
     if let Some(entry) = state.config.rpm.proxies.get(&repo) {
         let key = package_key(&repo, &path);
-        if validate_storage_key(&key).is_err() || path.starts_with(META_DIR) {
+        if validate_storage_key(&key).is_err() || is_internal_path(&path) {
             return StatusCode::BAD_REQUEST.into_response();
         }
         let lower = path.to_ascii_lowercase();
@@ -851,7 +1017,7 @@ async fn download(
         };
     }
     let key = package_key(&repo, &path);
-    if validate_storage_key(&key).is_err() || path.starts_with(META_DIR) {
+    if validate_storage_key(&key).is_err() || is_internal_path(&path) {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
@@ -933,7 +1099,7 @@ async fn check_exists(
         return StatusCode::NOT_FOUND.into_response();
     }
     let key = package_key(&repo, &path);
-    if validate_storage_key(&key).is_err() || path.starts_with(META_DIR) {
+    if validate_storage_key(&key).is_err() || is_internal_path(&path) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     match state.storage.stat(&key).await {
@@ -1182,15 +1348,204 @@ async fn reindex(
 }
 
 fn content_type(path: &str) -> &'static str {
-    if path.ends_with(".rpm") {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".rpm") {
         "application/x-rpm"
-    } else if path.ends_with(".xml") {
-        "application/xml"
-    } else if path.ends_with(".xml.gz") {
+    } else if lower.ends_with(".xml.gz")
+        || lower.ends_with(".yaml.gz")
+        || lower.ends_with(".yml.gz")
+    {
         "application/gzip"
+    } else if lower.ends_with(".xml") {
+        "application/xml"
+    } else if lower.ends_with(".yaml") || lower.ends_with(".yml") {
+        "text/yaml"
     } else {
         "application/octet-stream"
     }
+}
+
+// ============================================================================
+// Auxiliary metadata handlers (modules.yaml / comps.xml / updateinfo.xml)
+// ============================================================================
+
+/// Common validation for the `/rpm/{repo}/-/metadata` routes. Returns the
+/// parsed kind or the response to send back.
+async fn metadata_target(
+    state: &AppState,
+    repo: &str,
+    kind: &str,
+    authority: &NamespaceAuthority,
+) -> Result<AuxKind, Response> {
+    if !state.config.rpm.enabled {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+    if state.config.rpm.proxies.contains_key(repo) {
+        return Err(proxied_repo_conflict());
+    }
+    if !valid_repo_name(repo) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid repository name").into_response());
+    }
+    let Some(kind) = AuxKind::parse(kind) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Unknown metadata kind; expected modules, comps or updateinfo",
+        )
+            .into_response());
+    };
+    if enforce_namespace_scope(authority, repo).is_err() {
+        return Err(StatusCode::FORBIDDEN.into_response());
+    }
+    Ok(kind)
+}
+
+async fn put_metadata(
+    State(state): State<AppState>,
+    Path((repo, kind)): Path<(String, String)>,
+    Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
+    body: Bytes,
+) -> Response {
+    let kind = match metadata_target(&state, &repo, &kind, &authority).await {
+        Ok(kind) => kind,
+        Err(resp) => return resp,
+    };
+    if body.len() as u64 > state.config.rpm.max_file_size {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "File too large. Max size: {} bytes",
+                state.config.rpm.max_file_size
+            ),
+        )
+            .into_response();
+    }
+    let plain = match decode_metadata(&body, state.config.rpm.max_file_size) {
+        Ok(plain) => plain,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    let text = match std::str::from_utf8(&plain) {
+        Ok(text) => text,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Metadata must be UTF-8 text").into_response(),
+    };
+    if let Err(msg) = kind.validate(text) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
+    let key = aux_key(&repo, kind);
+    if validate_storage_key(&key).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let lock = state.publish_lock(&repomd_key(&repo));
+    let _guard = lock.lock().await;
+
+    if let Err(e) = state.storage.put(&key, &plain).await {
+        tracing::error!(error = %e, key = %key, "rpm: failed to store auxiliary metadata");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if let Err(e) = regenerate_repodata(&state.storage, state.signer.as_deref(), &repo).await {
+        tracing::error!(repo = %repo, error = %e, "rpm: repodata regeneration failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Metadata stored but repodata regeneration failed",
+        )
+            .into_response();
+    }
+
+    state.audit.log(AuditEntry::new(
+        "push",
+        crate::auth::audit_actor(&user),
+        &format!("{repo}/{AUX_DIR}/{}", kind.filename()),
+        "rpm",
+        "",
+    ));
+    state.activity.push(ActivityEntry::new(
+        ActionType::Push,
+        format!("{repo}/{}", kind.filename()),
+        crate::registry_type::RegistryType::Rpm,
+        "LOCAL",
+    ));
+    state.repo_index.invalidate("rpm");
+
+    StatusCode::CREATED.into_response()
+}
+
+async fn delete_metadata(
+    State(state): State<AppState>,
+    Path((repo, kind)): Path<(String, String)>,
+    Extension(authority): Extension<NamespaceAuthority>,
+    user: Option<Extension<crate::auth::AuthenticatedUser>>,
+) -> Response {
+    let kind = match metadata_target(&state, &repo, &kind, &authority).await {
+        Ok(kind) => kind,
+        Err(resp) => return resp,
+    };
+    let key = aux_key(&repo, kind);
+    if validate_storage_key(&key).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let lock = state.publish_lock(&repomd_key(&repo));
+    let _guard = lock.lock().await;
+
+    match state.storage.delete(&key).await {
+        Ok(()) => {}
+        Err(crate::storage::StorageError::NotFound) => {
+            return StatusCode::NOT_FOUND.into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, key = %key, "rpm: failed to delete auxiliary metadata");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    if let Err(e) = regenerate_repodata(&state.storage, state.signer.as_deref(), &repo).await {
+        tracing::error!(repo = %repo, error = %e, "rpm: repodata regeneration failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Metadata deleted but repodata regeneration failed",
+        )
+            .into_response();
+    }
+
+    state.audit.log(AuditEntry::new(
+        "delete",
+        crate::auth::audit_actor(&user),
+        &format!("{repo}/{AUX_DIR}/{}", kind.filename()),
+        "rpm",
+        "",
+    ));
+    state.repo_index.invalidate("rpm");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// List which auxiliary documents a hosted repo currently contains.
+async fn list_metadata(
+    State(state): State<AppState>,
+    Path(repo): Path<String>,
+    Extension(authority): Extension<NamespaceAuthority>,
+) -> Response {
+    if !state.config.rpm.enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !valid_repo_name(&repo) {
+        return (StatusCode::BAD_REQUEST, "Invalid repository name").into_response();
+    }
+    if enforce_namespace_scope(&authority, &repo).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut present = Vec::new();
+    for kind in AuxKind::ALL {
+        if let Some(meta) = state.storage.stat(&aux_key(&repo, kind)).await {
+            present.push(serde_json::json!({
+                "kind": kind.name(),
+                "file": kind.filename(),
+                "size": meta.size,
+                "repomd_type": kind.repomd_type(),
+            }));
+        }
+    }
+    axum::Json(serde_json::json!({ "repo": repo, "metadata": present })).into_response()
 }
 
 #[cfg(test)]
@@ -1579,6 +1934,267 @@ mod integration_tests {
         let a = primary.find("<name>aaa</name>").unwrap();
         let b = primary.find("<name>bbb</name>").unwrap();
         assert!(a < b, "packages must be sorted by name");
+    }
+
+    const MODULES_YAML: &str =
+        "---\ndocument: modulemd\nversion: 2\ndata:\n  name: php\n  stream: 8.2\n...\n";
+    const COMPS_XML: &str = "<?xml version=\"1.0\"?>\n<comps><group><id>php</id></group></comps>";
+    const UPDATEINFO_XML: &str =
+        "<?xml version=\"1.0\"?>\n<updates><update type=\"security\"><id>NORA-1</id></update></updates>";
+
+    #[test]
+    fn auxiliary_metadata_has_a_content_type() {
+        assert_eq!(
+            super::content_type("repodata/modules.yaml.gz"),
+            "application/gzip"
+        );
+        assert_eq!(
+            super::content_type("repodata/abc-modules.yaml"),
+            "text/yaml"
+        );
+        assert_eq!(
+            super::content_type("repodata/abc-updateinfo.xml"),
+            "application/xml"
+        );
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Repomd `<data>` entries whose location href ends with the given suffix.
+    fn repomd_entries(repomd: &str, kind: &str) -> Vec<String> {
+        let needle = "repodata/";
+        let prefix = format!("{kind}\"");
+        repomd
+            .split("<data type=\"")
+            .skip(1)
+            .filter(|entry| entry.starts_with(prefix.as_str()))
+            .filter_map(|entry| {
+                let start = entry.find(needle)? + needle.len();
+                let end = entry[start..].find('"')? + start;
+                Some(format!("{needle}{}", &entry[start..end]))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_rpm_aux_metadata_merged_into_repomd() {
+        let ctx = create_test_context();
+        for (kind, file, body) in [
+            ("modules", "modules.yaml", MODULES_YAML),
+            ("comps", "comps.xml", COMPS_XML),
+            ("updateinfo", "updateinfo.xml", UPDATEINFO_XML),
+        ] {
+            let resp = send(
+                &ctx.app,
+                Method::PUT,
+                &format!("/rpm/myrepo/-/metadata/{kind}"),
+                body,
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED, "{kind}: {body}");
+            // Stored verbatim (not the caller's gzip framing).
+            let stored = ctx
+                .state
+                .storage
+                .get(&format!("rpm/myrepo/.nora-aux/{file}"))
+                .await
+                .unwrap();
+            assert_eq!(stored, body.as_bytes());
+        }
+
+        let resp = send(&ctx.app, Method::GET, "/rpm/myrepo/repodata/repomd.xml", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let repomd = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        for (kind, suffix) in [
+            ("modules", "-modules.yaml.gz"),
+            ("group_gz", "-group_gz.xml.gz"),
+            ("updateinfo", "-updateinfo.xml.gz"),
+        ] {
+            let hrefs = repomd_entries(&repomd, kind);
+            assert_eq!(hrefs.len(), 1, "missing {kind} in {repomd}");
+            assert!(hrefs[0].ends_with(suffix), "{}", hrefs[0]);
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/rpm/myrepo/{}", hrefs[0]),
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let text = gunzip(&body_bytes(resp).await);
+            let expected = match kind {
+                "modules" => MODULES_YAML,
+                "group_gz" => COMPS_XML,
+                _ => UPDATEINFO_XML,
+            };
+            assert_eq!(text, expected);
+        }
+
+        // The listing endpoint reports what is on disk.
+        let resp = send(&ctx.app, Method::GET, "/rpm/myrepo/-/metadata", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let listing = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(listing.contains("\"modules\""), "{listing}");
+        assert!(listing.contains("comps.xml"), "{listing}");
+    }
+
+    #[tokio::test]
+    async fn test_rpm_aux_metadata_accepts_gzip_upload() {
+        let ctx = create_test_context();
+        let body = gzip(MODULES_YAML.as_bytes());
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/-/metadata/modules",
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Stored decompressed, so repomd's open-checksum covers the YAML.
+        let stored = ctx
+            .state
+            .storage
+            .get("rpm/myrepo/.nora-aux/modules.yaml")
+            .await
+            .unwrap();
+        assert_eq!(stored, MODULES_YAML.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_rpm_aux_metadata_rejects_invalid_documents() {
+        let ctx = create_test_context();
+        for (kind, body) in [
+            ("modules", "not: [valid"),
+            ("comps", "<html/>"),
+            ("updateinfo", "<notupdates/>"),
+            ("bogus", "<comps/>"),
+        ] {
+            let resp = send(
+                &ctx.app,
+                Method::PUT,
+                &format!("/rpm/myrepo/-/metadata/{kind}"),
+                body,
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{kind}: {body}");
+        }
+        // Nothing was written, so the repo still has its three generated files.
+        let keys = ctx.state.storage.list("rpm/myrepo/").await.unwrap();
+        assert!(
+            !keys.iter().any(|k| k.contains(".nora-aux")),
+            "rejected metadata must not be stored: {keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rpm_aux_metadata_delete_removes_repomd_entry() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/-/metadata/modules",
+            MODULES_YAML,
+        )
+        .await;
+        let resp = send(
+            &ctx.app,
+            Method::DELETE,
+            "/rpm/myrepo/-/metadata/modules",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = send(&ctx.app, Method::GET, "/rpm/myrepo/repodata/repomd.xml", "").await;
+        let repomd = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(repomd_entries(&repomd, "modules").is_empty(), "{repomd}");
+        // Deleting again is a 404.
+        let resp = send(
+            &ctx.app,
+            Method::DELETE,
+            "/rpm/myrepo/-/metadata/modules",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_rpm_aux_survives_repodata_regeneration_and_pruning() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/-/metadata/modules",
+            MODULES_YAML,
+        )
+        .await;
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/a.rpm",
+            build_test_rpm("aaa", "1.0"),
+        )
+        .await;
+        // A second publish regenerates (and prunes) repodata; the auxiliary
+        // document and its repomd entry must survive.
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/b.rpm",
+            build_test_rpm("bbb", "2.0"),
+        )
+        .await;
+
+        let resp = send(&ctx.app, Method::GET, "/rpm/myrepo/repodata/repomd.xml", "").await;
+        let repomd = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert_eq!(repomd_entries(&repomd, "modules").len(), 1, "{repomd}");
+        assert_eq!(
+            ctx.state
+                .storage
+                .get("rpm/myrepo/.nora-aux/modules.yaml")
+                .await
+                .unwrap(),
+            MODULES_YAML.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rpm_aux_paths_are_not_client_visible() {
+        let ctx = create_test_context();
+        send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/-/metadata/modules",
+            MODULES_YAML,
+        )
+        .await;
+        for method in [Method::GET, Method::HEAD, Method::DELETE] {
+            let resp = send(
+                &ctx.app,
+                method.clone(),
+                "/rpm/myrepo/.nora-aux/modules.yaml",
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{method}");
+        }
+        // Packages cannot be published into the internal directory either.
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/rpm/myrepo/.nora-aux/evil-1.0-1.x86_64.rpm",
+            build_test_rpm("evil", "1.0"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// Resume support on a `.rpm`: 206 for a byte range, 416 past the end,

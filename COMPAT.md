@@ -321,9 +321,20 @@ upstream's signatures) is served verbatim within `rpm.metadata_ttl` seconds
 | Offline mirror | Full | `nora mirror rpm --repo <name> [--arch x86_64,noarch]` warms the full package set |
 | sqlite metadata (`*_db`) | — | XML metadata only (all modern dnf/yum versions) |
 | Delta RPMs (`prestodelta`) | — | Not generated |
-| Module metadata (`modules.yaml`) | — | Not generated |
+| Module metadata (`modules.yaml`) | Full | Hosted: publish with `PUT {repo}/-/metadata/modules` (raw or gzip; repomd entry `type="modules"` is generated and survives reindexes). Proxied: the upstream's `modules` entry is passed through and cached like the other repodata files, and `nora mirror rpm` warms it |
+| Group/comps metadata | Full | Hosted: `PUT {repo}/-/metadata/comps` (repomd `type="group_gz"`). Proxied: passed through |
+| Updateinfo/errata | Full | Hosted: `PUT {repo}/-/metadata/updateinfo` (repomd `type="updateinfo"`). Proxied: passed through |
+| Auxiliary metadata delete/list | Full | `DELETE {repo}/-/metadata/{kind}`, `GET {repo}/-/metadata`; rebuilding and pruning repodata never removes the stored documents |
 
 Publish: `curl -u user:pass -T pkg.rpm http://nora:4000/rpm/myrepo/pkg.rpm`
+
+Publish module streams (optional, for PHP/nodejs module installs):
+
+```bash
+curl -u user:pass -T modules.yaml http://nora:4000/rpm/myrepo/-/metadata/modules
+curl -u user:pass -T comps.xml    http://nora:4000/rpm/myrepo/-/metadata/comps
+curl -u user:pass -T updateinfo.xml http://nora:4000/rpm/myrepo/-/metadata/updateinfo
+```
 
 Client `.repo` file:
 
