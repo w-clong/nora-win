@@ -2349,6 +2349,9 @@ async fn main() {
             if let Err(e) = mirror::run_mirror(format, &registry, concurrency, json, &client).await
             {
                 error!("Mirror failed: {}", e);
+                // `process::exit` skips destructors, so the non-blocking file sink would
+                // not flush: the failure line can be missing from NORA_LOG_FILE.
+                drop(_log_guard);
                 std::process::exit(1);
             }
         }
