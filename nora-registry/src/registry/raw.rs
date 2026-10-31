@@ -1641,8 +1641,10 @@ mod integration_tests {
     /// Makes a directory read-only for a test and gives it back on drop. `None` when this
     /// user can still write into it (root, CAP_DAC_OVERRIDE): the failure the test needs
     /// cannot be made here, and the test says so instead of passing on a write that worked.
+    #[cfg(unix)]
     struct ReadOnly(std::path::PathBuf);
 
+    #[cfg(unix)]
     impl ReadOnly {
         fn new(dir: std::path::PathBuf) -> Option<Self> {
             use std::os::unix::fs::PermissionsExt;
@@ -1658,6 +1660,7 @@ mod integration_tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for ReadOnly {
         fn drop(&mut self) {
             use std::os::unix::fs::PermissionsExt;
@@ -1667,6 +1670,7 @@ mod integration_tests {
 
     /// Only a taken name is 409: a raw write that fails for any other reason (here the
     /// directory refuses writes) stays a server fault.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_write_that_fails_for_another_reason_stays_500() {
         let ctx = create_test_context();
@@ -1681,6 +1685,7 @@ mod integration_tests {
 
     /// A delete that fails on a stored file is a fault, not "not found" while the file is
     /// still there and still served.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_delete_that_fails_on_a_stored_file_stays_a_fault() {
         let ctx = create_test_context();
@@ -1699,6 +1704,7 @@ mod integration_tests {
     /// a key whose path is a directory is a missing key on delete even when
     /// unlink(2) refuses it with an errno other than EISDIR (EACCES under a read-only
     /// parent on Linux; EPERM for any directory on macOS).
+    #[cfg(unix)]
     #[tokio::test]
     async fn deleting_a_directory_under_a_read_only_parent_is_not_found() {
         let ctx = create_test_context();

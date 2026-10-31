@@ -84,6 +84,8 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 | Package metadata (GET) | Full | JSON with all versions |
 | Scoped packages `@scope/name` | Full | URL-encoded path |
 | Tarball download | Full | SHA256 verified |
+| Tarball on another host (redirect) | Full | A tarball is fetched only for a version the upstream's packument lists (else 404, no tarball request). Redirects are followed to any http(s) host, at most 10 for the whole chain and within one `npm.proxy_timeout`; the upstream's credentials go only to its own origin, never past a hop that left it. An 11th redirect answers 502. Works with registries that serve tarballs from a storage host (GitHub Packages). |
+| Scoped upstream (`npm.proxies` with a scope) | Full | Metadata is read from the upstream's own origin only: a packument redirect to another origin answers 502. |
 | Tarball URL rewriting | Full | Points to NORA, not upstream |
 | Publish (`npm publish`) | Full | Immutable versions |
 | Unpublish | — | Immutable; use quarantine/blocklist to disable a version |
@@ -311,7 +313,7 @@ upstream's signatures) is served verbatim within `rpm.metadata_ttl` seconds
 | Package publish (`PUT {repo}/{name}.rpm`) | Full | Header parsed and validated; invalid RPMs rejected |
 | Package delete (`DELETE {repo}/{name}.rpm`) | Full | Repodata regenerated |
 | Package download | Full | Byte-identical, sha256 pkgid in repodata |
-| GPG-signed repodata (`repomd.xml.asc`) | Full | Signed on every regeneration; verify with `repo_gpgcheck=1`. Object-store backends (S3/GCS) require `signing.key_path` — without it signing is disabled with a startup warning |
+| GPG-signed repodata (`repomd.xml.asc`) | Full | Signed on every regeneration; verify with `repo_gpgcheck=1`. Object-store backends (S3/GCS) require `signing.key_path` — without it signing is disabled with a startup warning. A provisioned key must be Ed25519 (since 1.4.2); any other algorithm is a fatal startup error |
 | Public key (`repodata/repomd.xml.key`) | Full | Armored, for `gpgkey=`; key auto-generated at first boot |
 | Package signatures (`gpgcheck=1`) | — | Packages are stored as uploaded; NORA signs metadata, not packages |
 | Reconcile (`POST {repo}/-/reindex`) | Full | Heals out-of-band storage changes: drops orphan metadata, adopts added packages, rebuilds + re-signs repodata |

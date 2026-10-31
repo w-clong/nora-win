@@ -1809,9 +1809,14 @@ mod tests {
 
         // Backdate-forward the file's mtime to one hour ahead.
         let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        // The local backend escapes `:` in a key on Windows (see `key_to_path`).
+        #[cfg(unix)]
+        let disk_key = key.to_string();
+        #[cfg(not(unix))]
+        let disk_key = key.replace(':', "%3A");
         std::fs::File::options()
             .write(true)
-            .open(data.join(key))
+            .open(data.join(disk_key))
             .unwrap()
             .set_modified(future)
             .unwrap();
