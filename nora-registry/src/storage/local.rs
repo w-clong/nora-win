@@ -1132,7 +1132,11 @@ impl StorageBackend for LocalStorage {
                 // the mount for it.
                 let touch = dst_path.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
-                    std::fs::File::open(&touch)
+                    // Opened for write: Windows' SetFileTime needs write attributes, and a
+                    // read-only handle makes this refresh fail silently on every mount.
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&touch)
                         .and_then(|f| f.set_modified(std::time::SystemTime::now()))
                 })
                 .await

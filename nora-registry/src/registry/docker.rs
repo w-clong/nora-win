@@ -7778,8 +7778,13 @@ mod integration_tests {
                     .send()
             };
 
+            // The local backend escapes `:` in a key on Windows (see `key_to_path`).
+            #[cfg(unix)]
+            let disk_digest = digest.clone();
+            #[cfg(not(unix))]
+            let disk_digest = digest.replace(':', "%3A");
             let on_disk = std::path::Path::new(&ctx.state.config.storage.path)
-                .join(format!("docker/alpine/blobs/{digest}"));
+                .join(format!("docker/alpine/blobs/{disk_digest}"));
             let mut tampered = std::fs::read(&on_disk).unwrap();
             tampered[size / 2] ^= 0xFF;
             std::fs::write(&on_disk, &tampered).unwrap();

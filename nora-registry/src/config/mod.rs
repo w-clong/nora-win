@@ -3386,12 +3386,14 @@ proxies = [
     #[test]
     fn fatal_validation_is_an_error_not_a_panic() {
         assert_eq!(EXIT_CONFIG, 78, "EX_CONFIG from sysexits.h");
+        // 本分支在 checked() 里为未设置的 public_url 补全（0.0.0.0 默认监听也
+        // 能启动），所以通配监听不再是一条致命错误；这里用同样致命的 URL
+        // 协议错误来验证 EX_CONFIG 路径。通配监听必须显式给 public_url 的规则
+        // 仍由 validate() 的 test_validate_wildcard_host_requires_public_url 覆盖。
         let mut config = Config::default();
         config.server.host = "0.0.0.0".to_string();
-        config.server.public_url = None;
-        let err = config
-            .checked()
-            .expect_err("wildcard host without public_url");
+        config.server.public_url = Some("ftp://registry.example.com".to_string());
+        let err = config.checked().expect_err("public_url with a bad scheme");
         assert!(matches!(err, ConfigLoadError::Invalid(_)));
         assert!(err.to_string().contains("NORA_PUBLIC_URL"), "{err}");
 
