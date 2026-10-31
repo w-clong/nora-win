@@ -1076,9 +1076,7 @@ pub(crate) async fn reindex_repo(
         storage
             .delete(&sidecar_key(repo, stale))
             .await
-            .map_err(|e| {
-                ReindexError::Storage(format!("delete orphan sidecar {stale}: {e}"))
-            })?;
+            .map_err(|e| ReindexError::Storage(format!("delete orphan sidecar {stale}: {e}")))?;
         orphans_removed += 1;
     }
 
@@ -1097,13 +1095,12 @@ pub(crate) async fn reindex_repo(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let record = extract_record(&md, &body, missing, file_time, changelog_limit).map_err(
-            |e| {
+        let record =
+            extract_record(&md, &body, missing, file_time, changelog_limit).map_err(|e| {
                 ReindexError::InvalidPackage(format!(
                     "{missing}: RPM header missing required tags: {e}"
                 ))
-            },
-        )?;
+            })?;
         let json = serde_json::to_vec(&record)
             .map_err(|e| ReindexError::Storage(format!("serialize {missing}: {e}")))?;
         storage
@@ -1180,9 +1177,7 @@ async fn reindex(
         Err(ReindexError::InvalidPackage(msg)) => {
             (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response()
         }
-        Err(ReindexError::Storage(msg)) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
-        }
+        Err(ReindexError::Storage(msg)) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
     }
 }
 

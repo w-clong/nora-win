@@ -1624,18 +1624,16 @@ mod tests {
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.to_string_lossy().contains(".tmp.")
-                    || (path.starts_with(&staging)
-                        && path != staging
-                        && {
-                            #[cfg(unix)]
-                            {
-                                entry.file_name() != STAGING_LOCK_FILE
-                            }
-                            #[cfg(not(unix))]
-                            {
-                                true
-                            }
-                        })
+                    || (path.starts_with(&staging) && path != staging && {
+                        #[cfg(unix)]
+                        {
+                            entry.file_name() != STAGING_LOCK_FILE
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            true
+                        }
+                    })
                 {
                     found.push(path.to_string_lossy().into_owned());
                 }

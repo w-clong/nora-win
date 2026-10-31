@@ -108,10 +108,7 @@ async fn snapshot(
 
 /// Repositories (second key segment) touched by a diff, per registry prefix.
 /// `BTreeMap<RegistryType, BTreeSet<String>>` keeps ordering deterministic.
-fn changed_repos(
-    prev: &Fingerprint,
-    now: &Fingerprint,
-) -> HashMap<RegistryType, BTreeSet<String>> {
+fn changed_repos(prev: &Fingerprint, now: &Fingerprint) -> HashMap<RegistryType, BTreeSet<String>> {
     let mut out: HashMap<RegistryType, BTreeSet<String>> = HashMap::new();
     for key in prev.keys().chain(now.keys()) {
         let Some((prefix, rest)) = key.split_once('/') else {
@@ -167,7 +164,8 @@ pub async fn run_storage_watch(
     cancel: CancellationToken,
 ) {
     let mut baseline: Option<Fingerprint> = None;
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(cfg.interval_secs.max(1)));
+    let mut interval =
+        tokio::time::interval(std::time::Duration::from_secs(cfg.interval_secs.max(1)));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     info!(
         interval_secs = cfg.interval_secs,
@@ -198,9 +196,10 @@ pub async fn run_storage_watch(
                 for (rt, repos) in repos_with_artifacts(&snap) {
                     for repo in repos {
                         let index_exists = match rt {
-                            RegistryType::Deb => {
-                                storage.stat(&format!("deb/{repo}/Packages")).await.is_some()
-                            }
+                            RegistryType::Deb => storage
+                                .stat(&format!("deb/{repo}/Packages"))
+                                .await
+                                .is_some(),
                             RegistryType::Rpm => storage
                                 .stat(&format!("rpm/{repo}/repodata/repomd.xml"))
                                 .await
@@ -286,7 +285,10 @@ pub async fn run_storage_watch(
                 for rt in changed.keys() {
                     let name = rt.as_str();
                     repo_index.invalidate(name);
-                    info!(registry = name, "registry index invalidated after out-of-band change");
+                    info!(
+                        registry = name,
+                        "registry index invalidated after out-of-band change"
+                    );
                 }
                 let generation = ui_events.notify_changed();
                 info!(
@@ -403,7 +405,9 @@ mod tests {
         assert!(!is_watched_artifact("deb/myrepo/Packages.gz"));
         assert!(!is_watched_artifact("deb/myrepo/Release"));
         assert!(!is_watched_artifact("deb/myrepo/.nora-meta/foo.json"));
-        assert!(!is_watched_artifact("deb/myrepo/dists/bookworm/main/binary-amd64/Packages"));
+        assert!(!is_watched_artifact(
+            "deb/myrepo/dists/bookworm/main/binary-amd64/Packages"
+        ));
         assert!(is_watched_artifact("rpm/myrepo/foo-1.0-1.x86_64.rpm"));
         assert!(!is_watched_artifact("rpm/myrepo/repodata/repomd.xml"));
         assert!(!is_watched_artifact("rpm/myrepo/.nora-meta/foo.json"));
@@ -426,7 +430,11 @@ mod tests {
     fn changed_repos_tracks_add_remove_modify() {
         // deb/a: same size+mtime → unchanged; deb/c added; rpm/b modified;
         // raw/f untouched.
-        let prev = fp(&[("deb/a/one.deb", 10, 1), ("rpm/b/two.rpm", 20, 2), ("raw/f", 30, 3)]);
+        let prev = fp(&[
+            ("deb/a/one.deb", 10, 1),
+            ("rpm/b/two.rpm", 20, 2),
+            ("raw/f", 30, 3),
+        ]);
         let now = fp(&[
             ("deb/a/one.deb", 10, 1),
             ("deb/c/three.deb", 40, 4),
@@ -449,7 +457,9 @@ mod tests {
         let prev2 = fp(&[("deb/a/one.deb", 10, 1)]);
         let now2 = fp(&[("deb/a/one.deb", 11, 1)]);
         assert_eq!(
-            changed_repos(&prev2, &now2).get(&RegistryType::Deb).unwrap(),
+            changed_repos(&prev2, &now2)
+                .get(&RegistryType::Deb)
+                .unwrap(),
             &BTreeSet::from(["a".to_string()])
         );
     }

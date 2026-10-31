@@ -120,7 +120,6 @@ async fn api_discovery() -> Response {
         .into_response()
 }
 
-
 // ── v1 role API (legacy Galaxy roles) ────────────────────────────────────
 //
 // Legacy roles predate the collection (v3) API. ansible-galaxy's role
@@ -134,10 +133,7 @@ async fn api_discovery() -> Response {
 // caches role metadata (TTL-gated like collection metadata) plus role
 // tarballs (immutable, keyed by role id + version).
 
-async fn v1_roles_search(
-    State(state): State<AppState>,
-    RawQuery(raw_query): RawQuery,
-) -> Response {
+async fn v1_roles_search(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> Response {
     let Some(upstream) = upstream_url(&state) else {
         return StatusCode::BAD_GATEWAY.into_response();
     };
@@ -152,10 +148,7 @@ async fn v1_roles_search(
     proxy_json(&state, &url, "ansible-role-search", &cache_key, None).await
 }
 
-async fn v1_role_versions(
-    State(state): State<AppState>,
-    Path(role_id): Path<String>,
-) -> Response {
+async fn v1_role_versions(State(state): State<AppState>, Path(role_id): Path<String>) -> Response {
     if !is_valid_role_id(&role_id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -181,10 +174,7 @@ async fn v1_role_versions(
 /// caching the (un-rewritten) body under the metadata cache key with the
 /// collection-metadata TTL. The download path uses these entries' upstream
 /// `download_url` (GitHub tarball) to back the immutable role cache.
-async fn fetch_v1_role_versions(
-    state: &AppState,
-    role_id: &str,
-) -> Option<Vec<serde_json::Value>> {
+async fn fetch_v1_role_versions(state: &AppState, role_id: &str) -> Option<Vec<serde_json::Value>> {
     let cache_key = format!("ansible/metadata/roles/versions/{role_id}.json");
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut from_cache = false;
@@ -278,8 +268,8 @@ async fn fetch_v1_role_versions(
     // version list purely from cache and pull the tarball from the immutable
     // role cache).
     if !from_cache || synthesized {
-        let cached_body = serde_json::json!({ "count": results.len(), "results": results })
-            .to_string();
+        let cached_body =
+            serde_json::json!({ "count": results.len(), "results": results }).to_string();
         let _ = state.storage.put(&cache_key, cached_body.as_bytes()).await;
     }
     Some(results)
@@ -379,7 +369,11 @@ async fn v1_role_download(
     // Serve and migrate them so existing installations keep their cache.
     let legacy_key = format!("ansible/roles-cache/{role_id}/{version}.role");
     if let Ok(data) = state.storage.get(&legacy_key).await {
-        tracing::info!(role_id, version, "v1 role tarball served from legacy cache location");
+        tracing::info!(
+            role_id,
+            version,
+            "v1 role tarball served from legacy cache location"
+        );
         let _ = state.storage.put(&storage_key, &data).await;
         state.metrics.record_download("ansible");
         state.metrics.record_cache_hit("ansible");
@@ -392,7 +386,9 @@ async fn v1_role_download(
     };
     let Some(download_url) = versions.iter().find_map(|v| {
         if v.get("name").and_then(|n| n.as_str()) == Some(version.as_str()) {
-            v.get("download_url").and_then(|d| d.as_str()).map(str::to_string)
+            v.get("download_url")
+                .and_then(|d| d.as_str())
+                .map(str::to_string)
         } else {
             None
         }
@@ -1623,14 +1619,22 @@ mod tests {
 
         // Missing branch falls back to master; missing repo yields None.
         let no_branch = serde_json::json!({"github_user": "u", "github_repo": "r"});
-        assert_eq!(synthesize_branch_entry(&no_branch).unwrap()["name"], "master");
+        assert_eq!(
+            synthesize_branch_entry(&no_branch).unwrap()["name"],
+            "master"
+        );
         assert!(synthesize_branch_entry(&serde_json::json!({"github_user": "u"})).is_none());
         assert!(synthesize_branch_entry(&serde_json::Value::Null).is_none());
     }
 
     #[test]
     fn v1_safe_owner_accepts_galaxy_username_shapes() {
-        for u in ["geerlingguy", "klaiproalternance-ship-it", "seeven770", "a.b_c"] {
+        for u in [
+            "geerlingguy",
+            "klaiproalternance-ship-it",
+            "seeven770",
+            "a.b_c",
+        ] {
             assert!(is_safe_owner(u), "{u} should be a valid owner");
         }
         for u in ["", "..", "a/b", "a\\b", "a b"] {
@@ -1641,7 +1645,9 @@ mod tests {
     #[test]
     fn v1_role_version_shape_accepts_galaxy_tags() {
         // Galaxy role version tags: plain semver and two-part tags must pass.
-        for v in ["1.0.0", "2.0", "3.3.1", "v1.2.3", "2024.01", "master", "main"] {
+        for v in [
+            "1.0.0", "2.0", "3.3.1", "v1.2.3", "2024.01", "master", "main",
+        ] {
             assert!(is_valid_version(v), "{v} should be a valid role version");
         }
         for v in ["", "a/b", "..", "a\\b", "has space"] {

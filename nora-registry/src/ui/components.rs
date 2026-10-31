@@ -825,7 +825,8 @@ pub fn render_realtime_refresh_script() -> String {
         } catch (e) {}
     })();
     </script>
-    "##.to_string()
+    "##
+    .to_string()
 }
 
 /// SVG icon definitions for registries (exported for use in templates)

@@ -28,7 +28,10 @@ impl UiEventBus {
 
     /// Broadcast a repository-change event; returns the new generation.
     pub fn notify_changed(&self) -> u64 {
-        let generation = self.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let generation = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         let _ = self.tx.send(generation);
         generation
     }
@@ -309,7 +312,11 @@ pub(crate) async fn events_stream(
     let stream = stream::unfold(rx, |mut rx| async move {
         match rx.recv().await {
             Ok(generation) => Some((
-                Ok::<_, Infallible>(Event::default().event("reindex").data(generation.to_string())),
+                Ok::<_, Infallible>(
+                    Event::default()
+                        .event("reindex")
+                        .data(generation.to_string()),
+                ),
                 rx,
             )),
             // Subscriber missed events (lagged behind a burst) — still tell
