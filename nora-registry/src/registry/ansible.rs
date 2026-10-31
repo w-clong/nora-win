@@ -188,7 +188,7 @@ async fn fetch_v1_role_versions(state: &AppState, role_id: &str) -> Option<Vec<s
             if crate::cache_ttl::is_within_ttl(meta.modified, state.config.ansible.metadata_ttl) {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&data) {
                     if let Some(arr) = v.get("results").and_then(|r| r.as_array()) {
-                        results = arr.clone();
+                        results.clone_from(arr);
                         from_cache = true;
                     }
                 }
@@ -197,9 +197,7 @@ async fn fetch_v1_role_versions(state: &AppState, role_id: &str) -> Option<Vec<s
     }
 
     if !from_cache {
-        let Some(upstream) = upstream_url(state) else {
-            return None;
-        };
+        let upstream = upstream_url(state)?;
         let page_size = 50usize;
         loop {
             let url = format!(
@@ -305,9 +303,7 @@ async fn fetch_v1_role(state: &AppState, role_id: &str) -> Option<serde_json::Va
             }
         }
     }
-    let Some(upstream) = upstream_url(state) else {
-        return None;
-    };
+    let upstream = upstream_url(state)?;
     let url = format!(
         "{}/api/v1/roles/{}",
         upstream.trim_end_matches('/'),
